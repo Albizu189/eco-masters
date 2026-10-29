@@ -1,0 +1,20 @@
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        def localMaven = System.getenv("GODOT_MAVEN_REPO")
+        if (localMaven != null && !localMaven.isEmpty()) {
+            maven { url = uri(localMaven) }
+        }
+        mavenCentral()
+    }
+}
+rootProject.name = "EcoMasters"
+include ":app"
