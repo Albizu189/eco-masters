@@ -1,892 +1,938 @@
-extends Node2D
+extends Control
 
-var screen = "home"
-var overlay = ""
+const RECORDS_PATH = "user://records.json"
+const SETTINGS_PATH = "user://settings.cfg"
+const SAVE_PATH = "user://saved_game.json"
+const TOKEN_NAMES = {"water": "Water", "mountain": "Mountain", "trunk": "Trunk", "tree": "Tree", "field": "Field", "building": "Building"}
+
 var game = EcoGame.new()
-var spirit_enabled = true
-var sound_enabled = true
-var buttons: Dictionary = {}
-var disabled_buttons: Dictionary = {}
-var cell_regions: Dictionary = {}
-var market_regions: Array = []
-var faceup_regions: Array = []
-var active_regions: Dictionary = {}
+var screen = "home"
 var mode = "token"
-var selected_token_index = 0
+var spirit_enabled = true
 var selected_card_id = 0
+var selected_token_index = 0
 var detail_card: Dictionary = {}
-var detail_source = ""
+var detail_index = -1
+var score_result: Dictionary = {}
+var dark_mode = false
+var ui_scale = 1.0
+var hand_page = 0
+var saved_game_available = false
+var saved_summary: Dictionary = {}
+var records = {"games": 0, "best": 0, "last": 0, "suns": 0, "history": []}
+var sound_enabled = true
+var audio: Dictionary = {}
+var buttons: Dictionary = {}
+var board_hit: Array = []
+var cube_hit: Array = []
+var selected_hit: Array = []
 var toast = ""
 var toast_time = 0.0
-var fade = 0.0
-var clock = 0.0
+var elapsed = 0.0
 var animations: Array = []
-var help_page = 0
-var record_saved = false
-var records: Dictionary = {}
-var audio: Dictionary = {}
-var rng = RandomNumberGenerator.new()
+var fade = 1.0
+var regular: Font
+var bold: Font
+var board_center = Vector2.ZERO
+var board_radius = 32.0
+var logical_size = Vector2.ZERO
 
 func _ready() -> void:
-	rng.randomize()
-	_load_settings()
+	regular = load("res://assets/fonts/Inter-Regular.ttf")
+	bold = load("res://assets/fonts/Inter-SemiBold.ttf")
 	_load_records()
-	for sound_name in ["tap", "place", "complete", "finish"]:
-		var player = AudioStreamPlayer.new()
-		player.stream = _make_sound(sound_name)
-		add_child(player)
-		audio[sound_name] = player
-	get_viewport().size_changed.connect(queue_redraw)
+	_load_settings()
+	EcoArt.set_dark_mode(dark_mode)
+	_refresh_saved_summary()
+	_make_audio()
+	_update_scale()
+	get_viewport().size_changed.connect(_on_viewport_resized)
 	queue_redraw()
 
-func _process(delta: float) -> void:
-	clock += delta
-	fade = maxf(0.0, fade - delta * 2.8)
-	toast_time = maxf(0.0, toast_time - delta)
-	for item in animations:
-		item.age += delta
-	animations = animations.filter(func(item): return item.age < 0.7)
+func _on_viewport_resized() -> void:
+	_update_scale()
 	queue_redraw()
 
-func _input(event: InputEvent) -> void:
-	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT and event.pressed:
-		_handle_click(event.position)
-		get_viewport().set_input_as_handled()
-	elif event is InputEventKey and event.pressed and not event.echo:
-		if event.keycode == KEY_ESCAPE:
-			_handle_back()
-			get_viewport().set_input_as_handled()
+func _update_scale() -> void:
+	var physical = get_viewport_rect().size
+	if physical.x > physical.y and physical.y < 600:
+		# Compact landscape needs a shorter logical canvas so controls remain legible.
+		ui_scale = clampf(physical.y / 320.0, 1.0, 1.8)
+	else:
+		ui_scale = clampf(minf(physical.x / 390.0, physical.y / 640.0), 1.0, 3.0)
+
+func _view_size() -> Vector2:
+	return get_viewport_rect().size / ui_scale
 
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_WM_GO_BACK_REQUEST:
 		_handle_back()
+	elif what == NOTIFICATION_WM_CLOSE_REQUEST or what == NOTIFICATION_APPLICATION_PAUSED or what == NOTIFICATION_APPLICATION_FOCUS_OUT:
+		_save_game()
+
+func _exit_tree() -> void:
+	_save_game()
 
 func _handle_back() -> void:
-	if not overlay.is_empty() and overlay != "spirit":
-		overlay = ""
-	elif screen == "game":
-		overlay = "pause"
-	elif screen != "home":
+	match screen:
+		"game":
+			if not detail_card.is_empty():
+				detail_card = {}
+			else:
+				_save_game()
+				_change_screen("pause")
+		"pause": _change_screen("game")
+		"score": _change_screen("game")
+		"help", "records": _change_screen("home")
+		"results", "setup": _change_screen("home")
+		_: get_tree().quit()
+	queue_redraw()
+
+func _process(delta: float) -> void:
+	elapsed += delta
+	fade = maxf(0, fade - delta * 3.5)
+	if toast_time > 0:
+		toast_time -= delta
+	for i in range(animations.size() - 1, -1, -1):
+		animations[i].time -= delta
+		if animations[i].time <= 0:
+			animations.remove_at(i)
+	queue_redraw()
+
+func _draw() -> void:
+	buttons.clear()
+	board_hit.clear()
+	cube_hit.clear()
+	selected_hit.clear()
+	logical_size = _view_size()
+	var size = logical_size
+	draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE * ui_scale)
+	draw_rect(Rect2(Vector2.ZERO, size), EcoArt.CREAM)
+	match screen:
+		"home": _draw_home()
+		"setup": _draw_setup()
+		"game": _draw_game()
+		"pause": _draw_pause()
+		"score": _draw_score_overlay()
+		"results": _draw_results()
+		"help": _draw_help()
+		"records": _draw_records()
+	for animation in animations:
+		var p = _cell_position(animation.cell)
+		var progress = 1.0 - animation.time / 0.7
+		draw_arc(p, board_radius * (0.5 + progress * 0.8), 0, TAU, 40, Color(0.85, 0.65, 0.2, 1.0 - progress), 3, true)
+	if toast_time > 0:
+		var toast_rect = Rect2(size.x * 0.08, size.y - 60, size.x * 0.84, 42)
+		EcoArt.panel(self, toast_rect, EcoArt.INK, 18, false)
+		EcoArt.text(self, regular, toast, toast_rect.position + Vector2(12, 27), 14, EcoArt.PAPER, toast_rect.size.x - 24, HORIZONTAL_ALIGNMENT_CENTER)
+	if fade > 0:
+		draw_rect(Rect2(Vector2.ZERO, size), Color(EcoArt.CREAM, fade))
+
+func _button(id: String, label: String, rect: Rect2, primary: bool = false, enabled: bool = true) -> void:
+	var color = EcoArt.GREEN if primary else EcoArt.PAPER
+	if not enabled:
+		color = EcoArt.PAPER.darkened(0.04)
+	EcoArt.panel(self, rect, color, 14, primary)
+	if not primary:
+		EcoArt.outline(self, rect, EcoArt.LIGHT_GREEN.darkened(0.06), 14, 1.2)
+	EcoArt.text(self, bold, label, rect.position + Vector2(8, rect.size.y * 0.5 + 6), 16, EcoArt.PAPER if primary else (EcoArt.MUTED if not enabled else EcoArt.INK), rect.size.x - 16, HORIZONTAL_ALIGNMENT_CENTER)
+	if enabled:
+		buttons[id] = rect
+
+func _header(title: String, subtitle: String, back: bool = false) -> void:
+	if back:
+		_button("home", "←", Rect2(16, 18, 48, 44))
+	var x = 76 if back else 20
+	EcoArt.text(self, bold, title, Vector2(x, 40), 25)
+	EcoArt.text(self, regular, subtitle, Vector2(x, 61), 13, EcoArt.MUTED)
+
+func _draw_home() -> void:
+	var size = logical_size
+	if size.x > size.y and size.y < 440:
+		_draw_home_compact()
+		return
+	EcoArt.leaf(self, Vector2(size.x - 54, 66), 46, EcoArt.LIGHT_GREEN)
+	EcoArt.text(self, bold, "ECO", Vector2(24, 76), 44, EcoArt.GREEN)
+	EcoArt.text(self, bold, "MASTERS", Vector2(24, 116), 44)
+	EcoArt.text(self, regular, "Grow a little world.", Vector2(26, 146), 17, EcoArt.MUTED)
+	var hero = Rect2(20, 174, size.x - 40, minf(205, size.y * 0.27))
+	EcoArt.panel(self, hero, EcoArt.LIGHT_GREEN, 24, false)
+	var center = hero.get_center() + Vector2(0, 4)
+	EcoArt.sun(self, center + Vector2(hero.size.x * 0.31, -30), 27)
+	for data in [[-0.29, 0.08, "water"], [-0.08, 0.15, "field"], [0.13, 0.03, "tree"], [0.28, 0.19, "mountain"], [-0.03, -0.15, "building"]]:
+		EcoArt.token(self, data[2], center + Vector2(hero.size.x * data[0], data[1] * hero.size.y), minf(34, hero.size.y * 0.17))
+	EcoArt.text(self, bold, "Your solo ecosystem", hero.position + Vector2(18, 30), 18)
+	var y = hero.end.y + 22
+	var gap = 12.0
+	var has_save = saved_game_available
+	var height = minf(56, maxf(44, (size.y - y - 24 - gap * (4 if has_save else 3)) / (5 if has_save else 4)))
+	if has_save:
+		_button("continue", "Continue · Turn %d" % int(saved_summary.get("turn", 1)), Rect2(20, y, size.x - 40, height), true)
+		y += height + gap
+		_button("new", "New ecosystem", Rect2(20, y, size.x - 40, height))
+	else:
+		_button("new", "Start a new ecosystem", Rect2(20, y, size.x - 40, height), true)
+	y += height + gap
+	_button("help", "How to play", Rect2(20, y, size.x - 40, height))
+	y += height + gap
+	_button("records", "Local records", Rect2(20, y, size.x - 40, height))
+	y += height + gap
+	_button("sound", "Sound: " + ("on" if sound_enabled else "off"), Rect2(20, y, size.x - 40, height))
+	_button("dark", "Dark", Rect2(size.x - 76, 20, 56, 44))
+	EcoArt.text(self, regular, "Original art & sound · on-device only", Vector2(20, size.y - 12), 11, EcoArt.MUTED, size.x - 40, HORIZONTAL_ALIGNMENT_CENTER)
+
+func _draw_home_compact() -> void:
+	var size = logical_size
+	EcoArt.text(self, bold, "ECO MASTERS", Vector2(20, 47), 29, EcoArt.GREEN)
+	EcoArt.text(self, regular, "Grow a little world.", Vector2(22, 66), 13, EcoArt.MUTED)
+	var y = 78.0 if saved_game_available else 102.0
+	if saved_game_available:
+		_button("continue", "Continue · Turn %d" % int(saved_summary.get("turn", 1)), Rect2(20, y, size.x * 0.51, 44), true)
+		y += 48
+		_button("new", "New ecosystem", Rect2(20, y, size.x * 0.51, 44))
+	else:
+		_button("new", "Start a new ecosystem", Rect2(20, y, size.x * 0.51, 44), true)
+	y += 48
+	_button("help", "How to play", Rect2(20, y, size.x * 0.51, 44))
+	y += 48
+	_button("records", "Local records", Rect2(20, y, size.x * 0.51, 44))
+	_button("dark", "Dark", Rect2(size.x - 76, 14, 56, 44))
+	_button("sound", "Sound " + ("on" if sound_enabled else "off"), Rect2(size.x - 156, 14, 72, 44))
+	var hero = Rect2(size.x * 0.58, 58, size.x * 0.35, size.y - 78)
+	EcoArt.panel(self, hero, EcoArt.LIGHT_GREEN, 20, false)
+	for data in [[-0.25, 0.1, "water"], [0.0, 0.22, "field"], [0.23, 0.0, "tree"], [0.0, -0.23, "building"]]:
+		EcoArt.token(self, data[2], hero.get_center() + Vector2(hero.size.x * data[0], data[1] * hero.size.y), 25)
+
+func _draw_setup() -> void:
+	var size = logical_size
+	if size.x > size.y and size.y < 440:
+		_draw_setup_compact()
+		return
+	_header("New ecosystem", "Choose your solo setup", true)
+	var y = 88.0
+	EcoArt.text(self, bold, "Board side", Vector2(20, y), 18)
+	y += 14
+	_button("side_a", "A · Rivers & valleys", Rect2(20, y, (size.x - 50) / 2, 54), true)
+	_button("side_b", "B · Open wilderness", Rect2(30 + (size.x - 50) / 2, y, (size.x - 50) / 2, 54))
+	y += 78
+	EcoArt.text(self, bold, "Nature’s Spirit", Vector2(20, y), 18)
+	EcoArt.text(self, regular, "Optional: draw two and keep one.", Vector2(20, y + 24), 14, EcoArt.MUTED)
+	y += 38
+	_button("spirit_toggle", "Spirit: " + ("enabled" if spirit_enabled else "off"), Rect2(20, y, size.x - 40, 50))
+	y += 70
+	EcoArt.panel(self, Rect2(20, y, size.x - 40, 104), EcoArt.LIGHT_GREEN, 18, false)
+	EcoArt.text(self, bold, "Solo objective", Vector2(38, y + 30), 17)
+	EcoArt.text(self, regular, "Build habitats, place animal cubes, and", Vector2(38, y + 55), 14)
+	EcoArt.text(self, regular, "turn your final score into as many suns", Vector2(38, y + 76), 14)
+	EcoArt.text(self, regular, "as you can.", Vector2(38, y + 96), 14)
+	_button("begin", "Choose your spirit" if spirit_enabled else "Begin", Rect2(20, size.y - 76, size.x - 40, 56), true)
+
+func _draw_setup_compact() -> void:
+	var size = logical_size
+	_header("New ecosystem", "Solo setup", true)
+	EcoArt.text(self, bold, "Board side", Vector2(20, 92), 16)
+	_button("side_a", "A · Rivers", Rect2(20, 104, (size.x - 50) / 2, 48), true)
+	_button("side_b", "B · Wilderness", Rect2(30 + (size.x - 50) / 2, 104, (size.x - 50) / 2, 48))
+	_button("spirit_toggle", "Nature’s Spirit: " + ("enabled" if spirit_enabled else "off"), Rect2(20, 166, size.x - 40, 48))
+	_button("begin", "Choose your spirit" if spirit_enabled else "Begin", Rect2(20, size.y - 60, size.x - 40, 48), true)
+
+func _draw_spirit_choices() -> void:
+	var size = logical_size
+	if size.x > size.y and size.y < 440:
+		_draw_spirit_choices_compact()
+		return
+	_header("Choose your Spirit", "One scoring companion for this ecosystem", true)
+	var h = minf(380, (size.y - 140) / 2)
+	for i in range(game.spirit_options.size()):
+		var card: Dictionary = game.spirit_options[i]
+		var rect = Rect2(20, 92 + i * (h + 14), size.x - 40, h)
+		EcoArt.panel(self, rect, EcoArt.PAPER, 22)
+		EcoArt.text(self, bold, card.name, rect.position + Vector2(18, 34), 23)
+		EcoArt.text(self, regular, "Nature’s Spirit · one cube", rect.position + Vector2(18, 56), 13, EcoArt.MUTED)
+		EcoArt.pattern(self, card, Rect2(rect.position + Vector2(15, 68), Vector2(rect.size.x - 30, h - 148)))
+		EcoArt.text(self, regular, card.note, rect.position + Vector2(18, rect.size.y - 52), 13, EcoArt.MUTED, rect.size.x - 36, HORIZONTAL_ALIGNMENT_CENTER)
+		_button("spirit_%d" % i, "Choose " + card.name, Rect2(rect.position + Vector2(16, rect.size.y - 42), Vector2(rect.size.x - 32, 36)), true)
+
+func _draw_spirit_choices_compact() -> void:
+	var size = logical_size
+	_header("Choose your Spirit", "One scoring companion", true)
+	var width = (size.x - 52) / 2
+	for i in range(game.spirit_options.size()):
+		var card: Dictionary = game.spirit_options[i]
+		var rect = Rect2(20 + i * (width + 12), 86, width, size.y - 100)
+		EcoArt.panel(self, rect, EcoArt.PAPER, 18)
+		EcoArt.text(self, bold, card.name, rect.position + Vector2(12, 26), 18)
+		EcoArt.pattern(self, card, Rect2(rect.position + Vector2(10, 38), Vector2(rect.size.x - 20, rect.size.y - 98)))
+		_button("spirit_%d" % i, "Choose", Rect2(rect.position + Vector2(10, rect.size.y - 52), Vector2(rect.size.x - 20, 44)), true)
+
+func _draw_game() -> void:
+	var size = logical_size
+	if size.x > size.y and size.y < 440:
+		_draw_game_compact()
+		return
+	if not game.spirit_enabled and game.spirit.is_empty() and game.spirit_options.is_empty():
+		pass
+	elif game.spirit_enabled and not game.spirit.is_empty():
+		pass
+	elif game.spirit_enabled and game.spirit.is_empty():
+		_draw_spirit_choices()
+		return
+	EcoArt.text(self, bold, "ECO MASTERS", Vector2(18, 31), 20, EcoArt.GREEN)
+	EcoArt.text(self, regular, "Turn %d · Side %s" % [game.turn, game.side], Vector2(18, 50), 12, EcoArt.MUTED)
+	_button("score", "%d pts" % int(game.score().total), Rect2(size.x - 162, 14, 72, 44))
+	_button("pause", "Ⅱ", Rect2(size.x - 82, 14, 54, 44))
+	if game.active_count() == 0 and game.drafted:
+		EcoArt.text(self, bold, "Draft an Animal card", Vector2(18, 79), 17)
+	else:
+		EcoArt.text(self, bold, "1  Place tokens    2  Shape habitats", Vector2(18, 79), 16)
+	_draw_faceup()
+	_draw_board()
+	_draw_market()
+	_draw_acquired()
+	if not detail_card.is_empty():
+		_draw_card_detail()
+
+func _draw_game_compact() -> void:
+	var size = logical_size
+	if game.spirit_enabled and game.spirit.is_empty():
+		_draw_spirit_choices_compact()
+		return
+	EcoArt.text(self, bold, "ECO MASTERS", Vector2(14, 28), 18, EcoArt.GREEN)
+	EcoArt.text(self, regular, "Turn %d · Side %s · %d active" % [game.turn, game.side, game.active_count()], Vector2(14, 47), 12, EcoArt.MUTED)
+	_button("score", "%d pts" % int(game.score().total), Rect2(size.x - 196, 12, 68, 44))
+	_button("undo", "Undo", Rect2(size.x - 122, 12, 60, 44), false, game.can_undo())
+	_button("pause", "Ⅱ", Rect2(size.x - 56, 12, 46, 44))
+	var market_height = clampf(size.y * 0.24, 76, 88)
+	var faceup_height = minf(clampf(size.y * 0.34, 96, 128), size.y - market_height - 146)
+	var faceup_y = 70 + market_height + 4
+	var hint_y = faceup_y + faceup_height + 4
+	EcoArt.text(self, regular, "Select tokens → place all 3 → draft or refresh → end turn", Vector2(16, hint_y + 15), 11, EcoArt.MUTED, size.x * 0.49)
+	_draw_faceup(Rect2(10, faceup_y, size.x * 0.5 - 14, faceup_height))
+	_draw_board(Rect2(size.x * 0.51, 64, size.x * 0.48, size.y - 72))
+	_draw_market(Rect2(10, 66, size.x * 0.5 - 14, market_height))
+	_draw_acquired(Rect2(10, hint_y + 26, size.x - 20, size.y - hint_y - 32))
+	if not detail_card.is_empty():
+		_draw_card_detail()
+
+func _draw_faceup(area: Rect2 = Rect2()) -> void:
+	var size = logical_size
+	var y = area.position.y if area.size.x > 0 else 94.0
+	var width = (area.size.x - 16) / 3 if area.size.x > 0 else (size.x - 52) / 3
+	var x0 = area.position.x if area.size.x > 0 else 16.0
+	var card_height = area.size.y - 24 if area.size.x > 0 else 132.0
+	EcoArt.text(self, bold, "Available Animals", Vector2(x0 + 2, y), 13, EcoArt.MUTED)
+	for i in range(3):
+		var rect = Rect2(x0 + i * (width + 8), y + 10, width, card_height)
+		var card: Dictionary = game.faceup[i] if i < game.faceup.size() else {}
+		EcoArt.panel(self, rect, EcoArt.PAPER, 12, false)
+		EcoArt.outline(self, rect, EcoArt.LIGHT_GREEN.darkened(0.07), 12, 1)
+		if card.is_empty():
+			EcoArt.text(self, regular, "Deck empty", rect.position + Vector2(8, 58), 13, EcoArt.MUTED, rect.size.x - 16, HORIZONTAL_ALIGNMENT_CENTER)
+			continue
+			EcoArt.text(self, bold, card.name, rect.position + Vector2(7, 19), 12, EcoArt.INK, rect.size.x - 34)
+			EcoArt.animal_icon(self, int(card.id), rect.position + Vector2(rect.size.x - 14, 14), 8)
+			EcoArt.text(self, regular, "/".join(card.scores), rect.position + Vector2(7, 35), 10, EcoArt.MUTED, rect.size.x - 14)
+			EcoArt.pattern(self, card, Rect2(rect.position + Vector2(4, 40), Vector2(rect.size.x - 8, rect.size.y - 48)))
+			buttons["detail_%d" % i] = rect
+
+func _draw_board(area: Rect2 = Rect2()) -> void:
+	var size = logical_size
+	var available = area if area.size.x > 0 else Rect2(8, 246, size.x - 16, size.y - 518)
+	var board_width = available.size.x
+	var board_height = maxf(160, available.size.y)
+	board_center = available.get_center() + Vector2(0, 3)
+	var xs: Array = []
+	var ys: Array = []
+	for cell in game.board.keys():
+		var p = Vector2(sqrt(3) * (cell.x + cell.y * 0.5), 1.5 * cell.y)
+		xs.append(p.x)
+		ys.append(p.y)
+	var span_x = xs.max() - xs.min() + 2.0
+	var span_y = ys.max() - ys.min() + 1.8
+	board_radius = minf(board_width / span_x, board_height / span_y)
+	board_radius = maxf(18, board_radius)
+	var valid_cells: Array = []
+	if mode == "token" and game.selected_group >= 0 and selected_token_index < game.selected_tokens.size():
+		var token = game.selected_tokens[selected_token_index]
+		for cell in game.board.keys():
+			if EcoRules.can_place(game.board, game.cubes, cell, token):
+				valid_cells.append(cell)
+	elif mode == "cube":
+		valid_cells = game.available_cube_cells(selected_card_id)
+	for cell in game.board.keys():
+		var p = _cell_position(cell)
+		var stack: Array = game.board[cell]
+		var valid = valid_cells.has(cell)
+		var selected = (mode == "token" and valid and selected_hit.is_empty())
+		EcoArt.board_cell(self, p, board_radius * 0.92, stack, int(game.cubes.get(cell, 0)), selected, valid)
+		board_hit.append({"cell": cell, "center": p, "radius": board_radius * 0.95})
+	EcoArt.text(self, regular, "Side %s · %d open spaces" % [game.side, game.empty_cells()], Vector2(18, available.end.y + 14), 11, EcoArt.MUTED, available.size.x - 20, HORIZONTAL_ALIGNMENT_CENTER)
+
+func _cell_position(cell: Vector2i) -> Vector2:
+	return board_center + Vector2(sqrt(3) * (cell.x + cell.y * 0.5), 1.5 * cell.y) * board_radius
+
+func _draw_market(area: Rect2 = Rect2()) -> void:
+	var size = logical_size
+	var y = area.position.y if area.size.x > 0 else size.y - 260
+	var market_width = area.size.x if area.size.x > 0 else size.x - 32
+	var x0 = area.position.x if area.size.x > 0 else 16.0
+	var width = (market_width - 16) / 3
+	EcoArt.text(self, bold, "Token market", Vector2(x0 + 2, y), 14)
+	for i in range(3):
+		var rect = Rect2(x0 + i * (width + 8), y + 10, width, 66)
+		var selected = game.selected_group == i
+		EcoArt.panel(self, rect, EcoArt.LIGHT_GREEN if selected else EcoArt.PAPER, 12, false)
+		if selected:
+			EcoArt.outline(self, rect, EcoArt.GREEN, 12, 2)
+		if i < game.market.size():
+			for j in range(game.market[i].size()):
+				EcoArt.token(self, game.market[i][j], rect.position + Vector2(rect.size.x * (j + 0.5) / 3, rect.size.y * 0.52), minf(19, width * 0.14))
+			buttons["market_%d" % i] = rect
+	var selected_y = y + 88
+	if game.selected_group >= 0:
+		EcoArt.text(self, regular, "Selected:", Vector2(x0 + 2, selected_y + 22), 13, EcoArt.MUTED)
+		for i in range(game.selected_tokens.size()):
+			var center = Vector2(x0 + 84 + i * 50, selected_y + 17)
+			if i == selected_token_index:
+				draw_circle(center, 23, EcoArt.LIGHT_GREEN)
+			EcoArt.token(self, game.selected_tokens[i], center, 19)
+			selected_hit.append({"index": i, "rect": Rect2(center - Vector2(24, 24), Vector2(48, 48))})
+		_button("end", "End turn", Rect2(size.x - 124, selected_y, 108, 44), true, game.selected_tokens.is_empty())
+	else:
+		EcoArt.text(self, regular, "Choose one group. Other groups are discarded.", Vector2(x0 + 2, selected_y + 24), 12, EcoArt.MUTED)
+		_button("undo", "Undo", Rect2(size.x - 100, selected_y, 84, 44), false, game.can_undo())
+
+func _draw_acquired(area: Rect2 = Rect2()) -> void:
+	var size = logical_size
+	var y = area.position.y if area.size.x > 0 else size.y - 112
+	var all_cards: Array = game.acquired.duplicate()
+	if not game.spirit.is_empty():
+		all_cards.append(game.spirit)
+	var page_size = 3 if size.x > size.y else 2
+	var page_count = maxi(1, ceili(float(all_cards.size()) / page_size))
+	hand_page = clampi(hand_page, 0, page_count - 1)
+	EcoArt.text(self, bold, "Your habitats · live points", Vector2(area.position.x + 2 if area.size.x > 0 else 18, y), 13)
+	_button("hand_prev", "‹", Rect2(size.x - 104, y - 22, 44, 44), false, hand_page > 0)
+	_button("hand_next", "›", Rect2(size.x - 54, y - 22, 44, 44), false, hand_page < page_count - 1)
+	if all_cards.is_empty():
+		EcoArt.text(self, regular, "Draft a card to begin placing animal cubes.", Vector2(18, y + 32), 13, EcoArt.MUTED)
+		return
+	var start = hand_page * page_size
+	var count = mini(page_size, all_cards.size() - start)
+	var width = (size.x - 40 - (count - 1) * 8) / count
+	for i in range(count):
+		var card: Dictionary = all_cards[start + i]
+		var rect = Rect2(20 + i * (width + 8), y + 10, width, 76)
+		var active = int(card.get("cubes", 0)) < (1 if card.kind == "spirit" else card.scores.size())
+		EcoArt.panel(self, rect, EcoArt.PAPER, 11, false)
+		EcoArt.outline(self, rect, EcoArt.GREEN if selected_card_id == int(card.id) and mode == "cube" else EcoArt.LIGHT_GREEN.darkened(0.06), 11, 2 if selected_card_id == int(card.id) else 1)
+		EcoArt.text(self, bold, card.name, rect.position + Vector2(7, 17), 11, EcoArt.INK, rect.size.x - 42)
+		EcoArt.animal_icon(self, int(card.id), rect.position + Vector2(rect.size.x - 15, 14), 8)
+		EcoArt.text(self, regular, "%d pts · ◉%d" % [game.card_points(card), int(card.get("cubes", 0))], rect.position + Vector2(7, 34), 10, EcoArt.GOLD if not active else EcoArt.MUTED)
+		EcoArt.pattern(self, card, Rect2(rect.position + Vector2(5, 38), Vector2(rect.size.x - 10, 33)), false)
+		buttons["card_%d" % int(card.id)] = rect
+
+func _draw_card_detail() -> void:
+	var size = logical_size
+	draw_rect(Rect2(Vector2.ZERO, size), Color(0.04, 0.09, 0.07, 0.64))
+	var rect = Rect2(20, maxf(70, size.y * 0.12), size.x - 40, minf(500, size.y * 0.74))
+	EcoArt.panel(self, rect, EcoArt.PAPER, 22)
+	_button("close_detail", "×", Rect2(rect.end.x - 54, rect.position.y + 12, 44, 44))
+	EcoArt.text(self, bold, detail_card.name, rect.position + Vector2(18, 42), 24, EcoArt.INK, rect.size.x - 84)
+	EcoArt.animal_icon(self, int(detail_card.id), rect.position + Vector2(rect.size.x - 74, 34), 14)
+	EcoArt.text(self, regular, "Habitat pattern · rotate in six directions", rect.position + Vector2(18, 65), 13, EcoArt.MUTED)
+	EcoArt.pattern(self, detail_card, Rect2(rect.position + Vector2(20, 82), Vector2(rect.size.x - 40, rect.size.y - 220)))
+	EcoArt.text(self, regular, detail_card.note, rect.position + Vector2(20, rect.size.y - 115), 14, EcoArt.INK, rect.size.x - 40, HORIZONTAL_ALIGNMENT_CENTER)
+	EcoArt.text(self, regular, "Scores: " + "/".join(detail_card.scores), rect.position + Vector2(20, rect.size.y - 85), 14, EcoArt.MUTED, rect.size.x - 40, HORIZONTAL_ALIGNMENT_CENTER)
+	if game.can_draft(detail_index):
+		_button("draft_%d" % detail_index, "Draft this card", Rect2(rect.position + Vector2(16, rect.size.y - 64), Vector2(rect.size.x - 32, 48)), true)
+	elif not game.drafted and not game.refreshed and detail_index >= 0 and not game.deck.is_empty():
+		_button("refresh_%d" % detail_index, "Refresh from deck", Rect2(rect.position + Vector2(16, rect.size.y - 64), Vector2(rect.size.x - 32, 48)))
+	else:
+		EcoArt.text(self, regular, "Already drafted this turn." if game.drafted else "Card details", rect.position + Vector2(20, rect.size.y - 34), 13, EcoArt.MUTED, rect.size.x - 40, HORIZONTAL_ALIGNMENT_CENTER)
+
+func _draw_pause() -> void:
+	if logical_size.x > logical_size.y and logical_size.y < 440:
+		_draw_pause_compact()
+		return
+	var size = logical_size
+	EcoArt.text(self, bold, "Ecosystem paused", Vector2(24, 100), 30)
+	EcoArt.text(self, regular, "Your landscape is waiting.", Vector2(24, 130), 16, EcoArt.MUTED)
+	var y = 180.0
+	_button("resume", "Resume", Rect2(20, y, size.x - 40, 56), true)
+	y += 72
+	_button("restart", "Restart ecosystem", Rect2(20, y, size.x - 40, 52))
+	y += 66
+	_button("sound", "Sound: " + ("on" if sound_enabled else "off"), Rect2(20, y, size.x - 40, 52))
+	y += 66
+	_button("dark", "Dark mode: " + ("on" if dark_mode else "off"), Rect2(20, y, size.x - 40, 52))
+	y += 66
+	_button("help", "How to play", Rect2(20, y, size.x - 40, 52))
+	y += 66
+	_button("save_home", "Save & Main Menu", Rect2(20, y, size.x - 40, 52))
+
+func _draw_pause_compact() -> void:
+	var size = logical_size
+	EcoArt.text(self, bold, "Ecosystem paused", Vector2(20, 46), 26)
+	_button("resume", "Resume", Rect2(20, 68, size.x - 40, 44), true)
+	_button("restart", "Restart", Rect2(20, 120, (size.x - 50) / 2, 44))
+	_button("sound", "Sound: " + ("on" if sound_enabled else "off"), Rect2(30 + (size.x - 50) / 2, 120, (size.x - 50) / 2, 44))
+	_button("dark", "Dark: " + ("on" if dark_mode else "off"), Rect2(20, 172, (size.x - 50) / 2, 44))
+	_button("help", "How to play", Rect2(30 + (size.x - 50) / 2, 172, (size.x - 50) / 2, 44))
+	_button("save_home", "Save & Main Menu", Rect2(20, 224, size.x - 40, 44))
+
+func _draw_score_overlay() -> void:
+	var size = logical_size
+	var live = game.score()
+	EcoArt.text(self, bold, "Live ecosystem score", Vector2(20, 54), 26)
+	_button("close_score", "×", Rect2(size.x - 64, 18, 48, 44))
+	var rows = [
+		["Trees", int(live.trees)], ["Mountains", int(live.mountains)],
+		["Fields", int(live.fields)], ["Buildings", int(live.buildings)],
+		["Animals", int(live.animals)], ["Nature’s Spirit", int(live.spirit)],
+		["River" if game.side == "A" else "Land areas", int(live.river if game.side == "A" else live.areas)]
+	]
+	var y = 100.0
+	if size.y < 420:
+		for i in range(rows.size()):
+			var col = i % 2
+			var row = i / 2
+			var rect = Rect2(20 + col * (size.x - 32) / 2, 84 + row * 58, (size.x - 48) / 2, 50)
+			EcoArt.panel(self, rect, EcoArt.PAPER, 10, false)
+			EcoArt.text(self, regular, rows[i][0], rect.position + Vector2(10, 21), 12, EcoArt.MUTED, rect.size.x - 50)
+			EcoArt.text(self, bold, str(rows[i][1]), rect.position + Vector2(rect.size.x - 40, 32), 19)
+		y = 84 + ceili(rows.size() / 2.0) * 58 + 12
+	else:
+		for row in rows:
+			EcoArt.panel(self, Rect2(20, y, size.x - 40, 50), EcoArt.PAPER, 12, false)
+			EcoArt.text(self, regular, row[0], Vector2(38, y + 31), 15, EcoArt.MUTED)
+			EcoArt.text(self, bold, str(row[1]), Vector2(size.x - 78, y + 32), 19)
+			y += 58
+	EcoArt.text(self, bold, "Current total: %d · %d sun%s" % [int(live.total), int(live.suns), "" if int(live.suns) == 1 else "s"], Vector2(20, y + 24), 17, EcoArt.GREEN, size.x - 40, HORIZONTAL_ALIGNMENT_CENTER)
+
+func _draw_results() -> void:
+	var size = logical_size
+	if size.x > size.y and size.y < 440:
+		_draw_results_compact()
+		return
+	EcoArt.sun(self, Vector2(size.x / 2, 74), 30)
+	EcoArt.text(self, bold, "Ecosystem complete", Vector2(20, 132), 28, EcoArt.INK, size.x - 40, HORIZONTAL_ALIGNMENT_CENTER)
+	EcoArt.text(self, regular, game.end_reason, Vector2(28, 158), 13, EcoArt.MUTED, size.x - 56, HORIZONTAL_ALIGNMENT_CENTER)
+	var panel_rect = Rect2(20, 184, size.x - 40, minf(330, size.y - 340))
+	EcoArt.panel(self, panel_rect, EcoArt.PAPER, 22)
+	var labels = [
+		["Trees", score_result.trees], ["Mountains", score_result.mountains],
+		["Fields", score_result.fields], ["Buildings", score_result.buildings],
+		["Animals", score_result.animals], ["Nature’s Spirit", score_result.spirit],
+		["River" if game.side == "A" else "Land areas", score_result.river if game.side == "A" else score_result.areas]
+	]
+	var row_gap = minf(34, (panel_rect.size.y - 38) / labels.size())
+	for i in range(labels.size()):
+		var y = panel_rect.position.y + 28 + i * row_gap
+		EcoArt.text(self, regular, labels[i][0], Vector2(38, y), 14, EcoArt.MUTED)
+		EcoArt.text(self, bold, str(labels[i][1]), Vector2(size.x - 74, y), 15)
+	var result_y = panel_rect.end.y + 36
+	EcoArt.text(self, bold, "%d points" % int(score_result.total), Vector2(20, result_y), 34, EcoArt.GREEN, size.x - 40, HORIZONTAL_ALIGNMENT_CENTER)
+	EcoArt.text(self, bold, "%d sun%s · %s" % [int(score_result.suns), "" if int(score_result.suns) == 1 else "s", _rating(int(score_result.suns))], Vector2(20, result_y + 32), 18, EcoArt.INK, size.x - 40, HORIZONTAL_ALIGNMENT_CENTER)
+	var button_y = size.y - 116
+	_button("again", "Play again", Rect2(20, button_y, size.x - 40, 48), true)
+	_button("home", "Main menu", Rect2(20, button_y + 58, size.x - 40, 48))
+
+func _draw_results_compact() -> void:
+	var size = logical_size
+	EcoArt.text(self, bold, "Ecosystem complete · %d points" % int(score_result.total), Vector2(20, 42), 23, EcoArt.GREEN)
+	EcoArt.text(self, regular, "%d sun%s · %s" % [int(score_result.suns), "" if int(score_result.suns) == 1 else "s", _rating(int(score_result.suns))], Vector2(20, 66), 15)
+	var panel_rect = Rect2(20, 82, size.x * 0.58, size.y - 100)
+	EcoArt.panel(self, panel_rect, EcoArt.PAPER, 18)
+	var labels = [["Trees", score_result.trees], ["Mountains", score_result.mountains], ["Fields", score_result.fields], ["Buildings", score_result.buildings], ["Animals", score_result.animals], ["Spirit", score_result.spirit], ["River" if game.side == "A" else "Land areas", score_result.river if game.side == "A" else score_result.areas]]
+	var row_gap = minf(34, (panel_rect.size.y - 38) / labels.size())
+	for i in range(labels.size()):
+		var y = panel_rect.position.y + 28 + i * row_gap
+		EcoArt.text(self, regular, labels[i][0], Vector2(34, y), 13, EcoArt.MUTED)
+		EcoArt.text(self, bold, str(labels[i][1]), Vector2(panel_rect.end.x - 42, y), 14)
+	_button("again", "Play again", Rect2(size.x * 0.64, 102, size.x * 0.32, 48), true)
+	_button("home", "Main menu", Rect2(size.x * 0.64, 162, size.x * 0.32, 48))
+
+func _rating(suns: int) -> String:
+	if suns >= 3:
+		return "Master ecosystem"
+	if suns == 2:
+		return "Thriving landscape"
+	if suns == 1:
+		return "Growing habitat"
+	return "Keep cultivating"
+
+func _draw_help() -> void:
+	if logical_size.x > logical_size.y and logical_size.y < 440:
+		_draw_help_compact()
+		return
+	var size = logical_size
+	_header("How to play", "A compact guide to your solo turn", true)
+	var sections = [
+		["1 · Choose tokens", "Select one market group, then place all three tokens. Empty land accepts anything; new stacks must match the token below."],
+		["2 · Grow habitats", "Trees need trunks: T2 is trunk + tree; T3 is two trunks + tree. Mountains and buildings follow the card’s exact heights."],
+		["3 · Draft or refresh", "Draft at most one available Animal per turn, up to four active cards. If you do not draft, you may refresh one face-up card."],
+		["4 · Place cubes", "Tap one of your cards, then a highlighted matching habitat. A ring marks the pattern’s cube space. Rotate the pattern, but never mirror it."],
+		["5 · Finish & score", "End your turn after placing all selected tokens. Unchosen market groups are discarded. Earn suns at 60/90/120 points plus a configuration bonus."]
+	]
+	var y = 96.0
+	for section in sections:
+		EcoArt.text(self, bold, section[0], Vector2(22, y), 17)
+		y += 25
+		var lines = _wrap(section[1], 52)
+		for line in lines:
+			EcoArt.text(self, regular, line, Vector2(22, y), 13, EcoArt.MUTED)
+			y += 19
+		y += 17
+	EcoArt.text(self, regular, "On Android, the system Back button opens pause or returns.", Vector2(22, size.y - 24), 11, EcoArt.MUTED)
+
+func _draw_help_compact() -> void:
+	var size = logical_size
+	_header("How to play", "Solo turn guide", true)
+	var lines = ["Choose one market group; place all three tokens.", "Match exact stack heights. Ring = cube target.", "Draft one Animal or refresh one face-up card.", "Tap an owned card, then a highlighted habitat.", "Undo works within the current turn.", "End turn to discard other market groups.", "Suns: 60/90/120 points + configuration bonus."]
+	for i in range(lines.size()):
+		EcoArt.text(self, regular, lines[i], Vector2(22, 98 + i * 27), 13, EcoArt.MUTED, size.x - 44)
+
+func _draw_records() -> void:
+	if logical_size.x > logical_size.y and logical_size.y < 440:
+		_draw_records_compact()
+		return
+	var size = logical_size
+	_header("Local records", "Stored only on this device", true)
+	var stats = [["Games", int(records.games)], ["Best score", int(records.best)], ["Best suns", int(records.suns)]]
+	for i in range(3):
+		var width = (size.x - 52) / 3
+		var rect = Rect2(16 + i * (width + 10), 94, width, 94)
+		EcoArt.panel(self, rect, EcoArt.LIGHT_GREEN, 16, false)
+		EcoArt.text(self, bold, str(stats[i][1]), rect.position + Vector2(8, 42), 28, EcoArt.GREEN, rect.size.x - 16, HORIZONTAL_ALIGNMENT_CENTER)
+		EcoArt.text(self, regular, stats[i][0], rect.position + Vector2(8, 70), 12, EcoArt.MUTED, rect.size.x - 16, HORIZONTAL_ALIGNMENT_CENTER)
+	EcoArt.text(self, bold, "Recent ecosystems", Vector2(20, 230), 18)
+	if records.history.is_empty():
+		EcoArt.text(self, regular, "Complete a game to grow your records.", Vector2(20, 266), 14, EcoArt.MUTED)
+	for i in range(mini(7, records.history.size())):
+		var item: Dictionary = records.history[i]
+		var y = 256 + i * 48
+		EcoArt.panel(self, Rect2(20, y, size.x - 40, 40), EcoArt.PAPER, 10, false)
+		EcoArt.text(self, regular, "Side %s · %s" % [item.get("side", "A"), item.get("date", "")], Vector2(32, y + 25), 12, EcoArt.MUTED)
+		EcoArt.text(self, bold, "%d pts · %d suns" % [int(item.get("score", 0)), int(item.get("suns", 0))], Vector2(size.x * 0.54, y + 25), 13)
+
+func _draw_records_compact() -> void:
+	var size = logical_size
+	_header("Local records", "On this device", true)
+	var stats = [["Games", int(records.games)], ["Best score", int(records.best)], ["Best suns", int(records.suns)]]
+	for i in range(3):
+		var width = (size.x - 52) / 3
+		var rect = Rect2(16 + i * (width + 10), 82, width, 72)
+		EcoArt.panel(self, rect, EcoArt.LIGHT_GREEN, 14, false)
+		EcoArt.text(self, bold, str(stats[i][1]), rect.position + Vector2(8, 31), 23, EcoArt.GREEN, rect.size.x - 16, HORIZONTAL_ALIGNMENT_CENTER)
+		EcoArt.text(self, regular, stats[i][0], rect.position + Vector2(8, 55), 12, EcoArt.MUTED, rect.size.x - 16, HORIZONTAL_ALIGNMENT_CENTER)
+	for i in range(mini(4, records.history.size())):
+		var item: Dictionary = records.history[i]
+		var y = 170 + i * 42
+		EcoArt.text(self, regular, "Side %s · %s" % [item.get("side", "A"), item.get("date", "")], Vector2(20, y), 12, EcoArt.MUTED)
+		EcoArt.text(self, bold, "%d pts · %d suns" % [int(item.get("score", 0)), int(item.get("suns", 0))], Vector2(size.x * 0.57, y), 13)
+
+func _wrap(value: String, count: int) -> Array:
+	var lines: Array = []
+	var line = ""
+	for word in value.split(" "):
+		if line.length() + word.length() + 1 > count:
+			lines.append(line)
+			line = word
+		else:
+			line += (" " if not line.is_empty() else "") + word
+	if not line.is_empty():
+		lines.append(line)
+	return lines
+
+func _gui_input(event: InputEvent) -> void:
+	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT and event.pressed:
+		_handle_click(event.position / ui_scale)
+		accept_event()
+
+func _handle_click(position: Vector2) -> void:
+	for id in buttons:
+		if buttons[id].has_point(position):
+			_action(id)
+			return
+	if screen != "game" or not detail_card.is_empty():
+		return
+	for item in selected_hit:
+		if item.rect.has_point(position):
+			selected_token_index = item.index
+			mode = "token"
+			selected_card_id = 0
+			_play("tap")
+			return
+	for item in board_hit:
+		if position.distance_to(item.center) <= item.radius:
+			if mode == "token":
+				_place_token(item.cell)
+			elif mode == "cube":
+				_place_cube(item.cell)
+			return
+
+func _action(id: String) -> void:
+	_play("tap")
+	if id == "continue":
+		continue_game()
+	elif id == "new":
+		_change_screen("setup")
+	elif id == "side_a" or id == "side_b":
+		game.side = "A" if id == "side_a" else "B"
+	elif id == "spirit_toggle":
+		spirit_enabled = not spirit_enabled
+	elif id == "begin":
+		start_game(game.side if game.side in ["A", "B"] else "A")
+	elif id.begins_with("spirit_"):
+		if game.choose_spirit(int(id.trim_prefix("spirit_"))):
+			_play("success")
+			_save_game()
+	elif id == "home":
+		_save_game()
 		_change_screen("home")
+	elif id == "pause":
+		_save_game()
+		_change_screen("pause")
+	elif id == "resume":
+		_change_screen("game")
+	elif id == "restart":
+		start_game(game.side)
+	elif id == "sound":
+		sound_enabled = not sound_enabled
+		_save_settings()
+	elif id == "dark":
+		dark_mode = not dark_mode
+		EcoArt.set_dark_mode(dark_mode)
+		_save_settings()
+	elif id == "help":
+		_change_screen("help")
+	elif id == "records":
+		_change_screen("records")
+	elif id == "score":
+		_change_screen("score")
+	elif id == "close_score":
+		_change_screen("game")
+	elif id == "undo":
+		if game.undo():
+			mode = "token"
+			selected_card_id = 0
+			selected_token_index = 0
+			animations.clear()
+			_save_game()
+			_show_toast("Last action undone · scores updated")
+	elif id == "save_home":
+		_save_game()
+		_change_screen("home")
+	elif id == "again":
+		start_game(game.side)
+	elif id == "close_detail":
+		detail_card = {}
+		detail_index = -1
+	elif id == "hand_prev":
+		hand_page = maxi(0, hand_page - 1)
+	elif id == "hand_next":
+		hand_page += 1
+	elif id.begins_with("detail_"):
+		detail_index = int(id.trim_prefix("detail_"))
+		detail_card = game.faceup[detail_index]
+	elif id.begins_with("draft_"):
+		if game.draft_card(int(id.trim_prefix("draft_"))):
+			detail_card = {}
+			detail_index = -1
+			_play("success")
+			_save_game()
+	elif id.begins_with("refresh_"):
+		if game.refresh_card(int(id.trim_prefix("refresh_"))):
+			detail_card = {}
+			detail_index = -1
+			_save_game()
+	elif id.begins_with("market_"):
+		if game.select_market(int(id.trim_prefix("market_"))):
+			selected_token_index = 0
+			mode = "token"
+			_save_game()
+	elif id == "end":
+		if game.end_turn():
+			selected_card_id = 0
+			mode = "token"
+			if game.ended:
+				_finish_game()
+			else:
+				_play("success")
+				_save_game()
+	elif id.begins_with("card_"):
+		var card_id = int(id.trim_prefix("card_"))
+		selected_card_id = card_id
+		var cells = game.available_cube_cells(card_id)
+		if cells.is_empty():
+			_show_toast("No matching habitat is available for this card.")
+		else:
+			mode = "cube"
+			_show_toast("Place the cube on a highlighted habitat.")
+
+func _place_token(cell: Vector2i) -> void:
+	if selected_token_index >= game.selected_tokens.size():
+		return
+	var token = game.place_token(cell, selected_token_index)
+	if token.is_empty():
+		_show_toast("That token cannot be stacked here.")
+		_play("error")
+		return
+	selected_token_index = mini(selected_token_index, maxi(0, game.selected_tokens.size() - 1))
+	animations.append({"cell": cell, "time": 0.7})
+	_play("place")
+	_save_game()
+	if game.selected_tokens.is_empty():
+		_show_toast("Tokens placed. Draft a card or end your turn.")
+	elif not game.has_legal_token_placement():
+		game.finish_early()
+		_finish_game()
+
+func _place_cube(cell: Vector2i) -> void:
+	if game.place_cube(selected_card_id, cell):
+		animations.append({"cell": cell, "time": 0.7})
+		mode = "token"
+		selected_card_id = 0
+		_play("success")
+		_save_game()
+	else:
+		_show_toast("Match the exact habitat and its ringed cube space.")
+		_play("error")
+
+func start_game(side: String) -> void:
+	game = EcoGame.new()
+	game.new_game(side, spirit_enabled)
+	mode = "token"
+	hand_page = 0
+	selected_card_id = 0
+	detail_card = {}
+	_save_game()
+	_change_screen("game")
+
+func continue_game() -> void:
+	if not FileAccess.file_exists(SAVE_PATH):
+		_refresh_saved_summary()
+		_show_toast("No saved ecosystem found.")
+		return
+	var parsed = JSON.parse_string(FileAccess.get_file_as_string(SAVE_PATH))
+	var restored = EcoGame.new()
+	if not parsed is Dictionary or not restored.load_dict(parsed):
+		_show_toast("This saved game is not compatible with version 1.1.")
+		return
+	game = restored
+	mode = "token"
+	selected_card_id = 0
+	selected_token_index = 0
+	detail_card = {}
+	hand_page = 0
+	if game.ended:
+		score_result = game.score()
+		_change_screen("results")
+	else:
+		_change_screen("game")
+	_show_toast("Saved ecosystem restored.")
 
 func _change_screen(next_screen: String) -> void:
 	screen = next_screen
-	overlay = ""
-	fade = 0.65
-	_play("tap")
+	fade = 0.45
+	detail_card = {}
+	detail_index = -1
+	queue_redraw()
 
-func start_game(side: String) -> void:
-	game.new_game(side, spirit_enabled)
-	mode = "token"
-	selected_token_index = 0
-	selected_card_id = 0
-	record_saved = false
-	animations.clear()
-	_change_screen("game")
-	if spirit_enabled:
-		overlay = "spirit"
-	_show_toast("Choose a token group to begin" if not spirit_enabled else "Choose your Nature’s Spirit")
+func _finish_game() -> void:
+	score_result = game.score()
+	records.games = int(records.games) + 1
+	records.last = int(score_result.total)
+	records.best = maxi(int(records.best), int(score_result.total))
+	records.suns = maxi(int(records.suns), int(score_result.suns))
+	records.history.push_front({"score": int(score_result.total), "suns": int(score_result.suns), "side": game.side, "date": Time.get_date_string_from_system()})
+	records.history = records.history.slice(0, 20)
+	_save_records()
+	_save_game()
+	_play("success")
+	_change_screen("results")
+
+func _save_game() -> void:
+	if screen == "home" or game.board.is_empty():
+		return
+	var file = FileAccess.open(SAVE_PATH, FileAccess.WRITE)
+	if file:
+		file.store_string(JSON.stringify(game.to_dict()))
+		file.close()
+	_refresh_saved_summary()
+
+func _delete_save() -> void:
+	if FileAccess.file_exists(SAVE_PATH):
+		DirAccess.remove_absolute(SAVE_PATH)
+	_refresh_saved_summary()
+
+func _refresh_saved_summary() -> void:
+	saved_game_available = false
+	saved_summary = {}
+	if not FileAccess.file_exists(SAVE_PATH):
+		return
+	var parsed = JSON.parse_string(FileAccess.get_file_as_string(SAVE_PATH))
+	if parsed is Dictionary and int(parsed.get("save_version", 0)) == EcoGame.SAVE_VERSION:
+		saved_game_available = true
+		saved_summary = {"turn": int(parsed.get("turn", 1)), "side": str(parsed.get("side", "A")), "ended": bool(parsed.get("ended", false))}
 
 func _show_toast(message: String) -> void:
 	toast = message
 	toast_time = 3.0
 
-func _play(sound_name: String) -> void:
-	if sound_enabled and audio.has(sound_name) and audio[sound_name].stream != null:
-		audio[sound_name].stop()
-		audio[sound_name].play()
+func _load_records() -> void:
+	if FileAccess.file_exists(RECORDS_PATH):
+		var parsed = JSON.parse_string(FileAccess.get_file_as_string(RECORDS_PATH))
+		if parsed is Dictionary:
+			records.merge(parsed, true)
+
+func _save_records() -> void:
+	var file = FileAccess.open(RECORDS_PATH, FileAccess.WRITE)
+	if file:
+		file.store_string(JSON.stringify(records))
 
 func _load_settings() -> void:
 	var config = ConfigFile.new()
-	if config.load("user://settings.cfg") == OK:
+	if config.load(SETTINGS_PATH) == OK:
 		sound_enabled = bool(config.get_value("audio", "enabled", true))
+		dark_mode = bool(config.get_value("display", "dark", false))
 
 func _save_settings() -> void:
 	var config = ConfigFile.new()
 	config.set_value("audio", "enabled", sound_enabled)
-	config.save("user://settings.cfg")
+	config.set_value("display", "dark", dark_mode)
+	config.save(SETTINGS_PATH)
 
-func _default_records() -> Dictionary:
-	return {
-		"A": {"best_score": 0, "best_suns": 0, "games": 0},
-		"B": {"best_score": 0, "best_suns": 0, "games": 0},
-		"history": []
-	}
+func _make_audio() -> void:
+	for sound in ["tap", "place", "success", "error"]:
+		var player = AudioStreamPlayer.new()
+		player.stream = _tone(sound)
+		add_child(player)
+		audio[sound] = player
 
-func _load_records() -> void:
-	records = _default_records()
-	if not FileAccess.file_exists("user://records.json"):
-		return
-	var file = FileAccess.open("user://records.json", FileAccess.READ)
-	var parsed = JSON.parse_string(file.get_as_text())
-	if parsed is Dictionary:
-		for key in ["A", "B"]:
-			if parsed.has(key):
-				records[key] = parsed[key]
-		if parsed.has("history") and parsed.history is Array:
-			records.history = parsed.history
-
-func _save_result(result: Dictionary) -> void:
-	if record_saved:
-		return
-	record_saved = true
-	var side_record: Dictionary = records[game.side]
-	side_record.games = int(side_record.get("games", 0)) + 1
-	side_record.best_score = maxi(int(side_record.get("best_score", 0)), int(result.total))
-	side_record.best_suns = maxi(int(side_record.get("best_suns", 0)), int(result.suns))
-	records[game.side] = side_record
-	var history_entry = {"side": game.side, "score": int(result.total), "suns": int(result.suns), "turns": game.turn}
-	records.history.push_front(history_entry)
-	records.history = records.history.slice(0, 5)
-	var file = FileAccess.open("user://records.json", FileAccess.WRITE)
-	file.store_string(JSON.stringify(records, "  "))
-	_play("finish")
-
-func _draw() -> void:
-	buttons.clear()
-	disabled_buttons.clear()
-	cell_regions.clear()
-	market_regions.clear()
-	faceup_regions.clear()
-	active_regions.clear()
-	_draw_background()
-	match screen:
-		"home": _draw_home()
-		"game": _draw_game()
-		"results": _draw_results()
-		"records": _draw_records()
-		"help": _draw_help()
-	if not overlay.is_empty():
-		buttons.clear()
-		disabled_buttons.clear()
-		cell_regions.clear()
-		market_regions.clear()
-		faceup_regions.clear()
-		active_regions.clear()
-		_draw_overlay()
-	if toast_time > 0.0 and overlay.is_empty():
-		_draw_toast()
-	if fade > 0.0:
-		draw_rect(Rect2(Vector2.ZERO, get_viewport_rect().size), Color(0.08, 0.16, 0.13, fade))
-
-func _draw_background() -> void:
-	var size = get_viewport_rect().size
-	draw_rect(Rect2(Vector2.ZERO, size), EcoArt.CREAM)
-	draw_circle(Vector2(size.x * 0.93, size.y * 0.08), minf(size.x, size.y) * 0.24, Color("e3ecdb"))
-	draw_circle(Vector2(size.x * 0.03, size.y * 0.96), minf(size.x, size.y) * 0.2, Color("eee3ca"))
-	for i in range(6):
-		var p = Vector2(size.x - 30 - i * 22, 25 + (i % 2) * 14)
-		draw_circle(p, 2.5, Color("b7c8ae"))
-
-func _button(id: String, rect: Rect2, label: String, style: String = "primary", enabled: bool = true, font_size: int = 18) -> void:
-	buttons[id] = rect
-	if not enabled:
-		disabled_buttons[id] = true
-	var fill = EcoArt.GREEN
-	var ink = Color.WHITE
-	if style == "secondary":
-		fill = Color("e2eadc")
-		ink = EcoArt.INK
-	elif style == "ghost":
-		fill = Color(1, 1, 1, 0.45)
-		ink = EcoArt.INK
-	elif style == "gold":
-		fill = EcoArt.GOLD
-		ink = EcoArt.INK
-	if not enabled:
-		fill = Color("d9ddd3")
-		ink = Color("939c92")
-	EcoArt.rounded(self, rect, fill, mini(14, int(rect.size.y * 0.25)))
-	EcoArt.text_center(self, label, rect.get_center() + Vector2(0, font_size * 0.35), font_size, ink)
-
-func _heading(label: String, position: Vector2, size: int = 15) -> void:
-	EcoArt.text(self, label, position, size, EcoArt.MUTED)
-
-func _draw_home() -> void:
-	var size = get_viewport_rect().size
-	var portrait = size.y > size.x
-	_button("sound", Rect2(size.x - 66, 18, 48, 48), "SOUND" if sound_enabled else "MUTED", "ghost", true, 10)
-	if portrait:
-		EcoArt.leaf(self, Vector2(size.x * 0.5, size.y * 0.16), 1.65)
-		EcoArt.text_center(self, "ECO", Vector2(size.x * 0.5, size.y * 0.29), 52, EcoArt.INK)
-		EcoArt.text_center(self, "MASTERS", Vector2(size.x * 0.5, size.y * 0.29 + 54), 52, EcoArt.GREEN)
-		EcoArt.text_center(self, "A quiet world, built one habitat at a time.", Vector2(size.x * 0.5, size.y * 0.29 + 87), 15, EcoArt.MUTED)
-		var w = minf(360, size.x - 42)
-		var x = (size.x - w) * 0.5
-		var y = size.y * 0.49
-		_button("play_a", Rect2(x, y, w, 58), "PLAY SOLO  ·  SIDE A", "primary")
-		_button("play_b", Rect2(x, y + 68, w, 58), "PLAY SOLO  ·  SIDE B", "secondary")
-		_button("spirit", Rect2(x, y + 138, w, 48), "NATURE’S SPIRIT  ·  " + ("ON" if spirit_enabled else "OFF"), "ghost", true, 15)
-		_button("records", Rect2(x, y + 200, w * 0.48, 50), "RECORDS", "ghost", true, 15)
-		_button("help", Rect2(x + w * 0.52, y + 200, w * 0.48, 50), "HOW TO PLAY", "ghost", true, 15)
-	elif size.y < 600:
-		var left = maxf(36, size.x * 0.06)
-		var w = minf(330, size.x * 0.43)
-		EcoArt.leaf(self, Vector2(left + 24, 52), 0.55)
-		EcoArt.text(self, "ECO MASTERS", Vector2(left, 112), 40, EcoArt.INK)
-		EcoArt.text(self, "Grow landscapes. Welcome wildlife.", Vector2(left, 140), 15, EcoArt.MUTED)
-		_button("play_a", Rect2(left, 162, w, 46), "PLAY SOLO  ·  SIDE A", "primary", true, 16)
-		_button("play_b", Rect2(left, 218, w, 46), "PLAY SOLO  ·  SIDE B", "secondary", true, 16)
-		_button("spirit", Rect2(left, 274, w, 44), "NATURE’S SPIRIT  ·  " + ("ON" if spirit_enabled else "OFF"), "ghost", true, 13)
-		_button("records", Rect2(left, 330, w * 0.48, 44), "RECORDS", "ghost", true, 12)
-		_button("help", Rect2(left + w * 0.52, 330, w * 0.48, 44), "HOW TO PLAY", "ghost", true, 12)
-		_draw_home_hero(Rect2(size.x * 0.58, 54, size.x * 0.35, size.y - 92))
-	else:
-		var left = maxf(56, size.x * 0.08)
-		EcoArt.leaf(self, Vector2(left + 34, 88), 0.8)
-		EcoArt.text(self, "ECO MASTERS", Vector2(left, 186), 58, EcoArt.INK)
-		EcoArt.text(self, "Grow landscapes. Welcome wildlife.", Vector2(left, 224), 20, EcoArt.MUTED)
-		var w = minf(380, size.x * 0.36)
-		_button("play_a", Rect2(left, 280, w, 58), "PLAY SOLO  ·  SIDE A")
-		_button("play_b", Rect2(left, 350, w, 58), "PLAY SOLO  ·  SIDE B", "secondary")
-		_button("spirit", Rect2(left, 422, w, 48), "NATURE’S SPIRIT  ·  " + ("ON" if spirit_enabled else "OFF"), "ghost", true, 15)
-		_button("records", Rect2(left, 486, w * 0.48, 50), "RECORDS", "ghost", true, 15)
-		_button("help", Rect2(left + w * 0.52, 486, w * 0.48, 50), "HOW TO PLAY", "ghost", true, 15)
-		_draw_home_hero(Rect2(size.x * 0.53, size.y * 0.18, size.x * 0.4, size.y * 0.65))
-	if size.y >= 600:
-		EcoArt.text(self, "Original digital adaptation · Godot 4", Vector2(20, size.y - 18), 12, EcoArt.MUTED)
-
-func _draw_home_hero(rect: Rect2) -> void:
-	EcoArt.rounded(self, rect, Color("e4ead9"), 32)
-	var center = rect.get_center() + Vector2(0, -12)
-	var cells = [Vector2i(0, 0), Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1), Vector2i(1, -1), Vector2i(-1, 1)]
-	var names = ["tree", "water", "field", "mountain", "building", "trunk", "water"]
-	for i in range(cells.size()):
-		var cell: Vector2i = cells[i]
-		var p = center + Vector2(1.5 * cell.x, sqrt(3.0) * (cell.y + cell.x * 0.5)) * minf(55, rect.size.x * 0.1)
-		EcoArt.token(self, names[i], p, minf(50, rect.size.x * 0.09))
-	EcoArt.text_center(self, "YOUR LITTLE WILDERNESS", Vector2(center.x, rect.end.y - 28), 14, EcoArt.MUTED)
-
-func _game_layout() -> Dictionary:
-	var size = get_viewport_rect().size
-	var portrait = size.y > size.x * 1.05
-	if portrait:
-		var board_height = maxf(160, size.y - 478)
-		var board = Rect2(8, 70, size.x - 16, board_height)
-		var hint = Rect2(8, board.end.y + 4, size.x - 16, 60)
-		var market = Rect2(8, hint.end.y + 4, size.x - 16, 94)
-		var faceup = Rect2(8, market.end.y + 4, size.x - 16, 128)
-		var active = Rect2(8, size.y - 108, size.x - 16, 100)
-		return {"portrait": true, "compact": false, "board": board, "hint": hint, "market": market, "faceup": faceup, "active": active, "right": Rect2()}
-	var left_width = size.x * 0.6
-	if size.y < 600:
-		return {
-			"portrait": false, "compact": true,
-			"board": Rect2(12, 70, left_width - 24, size.y - 174),
-			"right": Rect2(left_width + 4, 70, size.x - left_width - 16, size.y - 78),
-			"market": Rect2(left_width + 4, 70, size.x - left_width - 16, 88),
-			"faceup": Rect2(left_width + 4, 164, size.x - left_width - 16, 112),
-			"hint": Rect2(left_width + 4, 282, size.x - left_width - 16, size.y - 292),
-			"active": Rect2(12, size.y - 94, left_width - 24, 86)
-		}
-	return {
-		"portrait": false, "compact": false,
-		"board": Rect2(18, 80, left_width - 30, size.y - 218),
-		"right": Rect2(left_width + 4, 80, size.x - left_width - 20, size.y - 92),
-		"market": Rect2(left_width + 4, 80, size.x - left_width - 20, 136),
-		"faceup": Rect2(left_width + 4, 228, size.x - left_width - 20, 176),
-		"hint": Rect2(left_width + 4, 416, size.x - left_width - 20, maxf(70, size.y - 498)),
-		"active": Rect2(16, size.y - 126, left_width - 28, 110)
-	}
-
-func _draw_game() -> void:
-	var size = get_viewport_rect().size
-	var layout = _game_layout()
-	var current = game.score()
-	EcoArt.rounded(self, Rect2(10, 10, size.x - 20, 52), Color(1, 1, 1, 0.66), 16)
-	_button("pause", Rect2(18, 14, 48, 44), "II", "ghost", true, 18)
-	if size.x < 600:
-		EcoArt.text(self, "ECO · " + game.side, Vector2(76, 42), 18, EcoArt.INK)
-	else:
-		EcoArt.text(self, "ECO MASTERS", Vector2(78, 43), 21, EcoArt.INK)
-		EcoArt.text(self, "SIDE " + game.side, Vector2(220, 42), 12, EcoArt.MUTED)
-	var score_x = size.x * (0.48 if size.x < 600 else 0.5)
-	EcoArt.text_center(self, "LIVE SCORE", Vector2(score_x, 27), 9, EcoArt.MUTED)
-	EcoArt.text_center(self, str(current.total), Vector2(score_x, 50), 22, EcoArt.GREEN)
-	EcoArt.text(self, "POUCH %d" % game.bag.size(), Vector2(size.x - (140 if size.x < 600 else 250), 42), 12, EcoArt.MUTED)
-	EcoArt.text(self, "OPEN %d" % game.empty_cells(), Vector2(size.x - (72 if size.x < 600 else 142), 42), 12, EcoArt.MUTED)
-	_draw_board(layout.board)
-	_draw_market(layout.market)
-	_draw_faceup(layout.faceup)
-	_draw_active(layout.active)
-	_draw_turn_controls(layout.hint, layout.portrait or layout.compact)
-
-func _draw_board(rect: Rect2) -> void:
-	EcoArt.rounded(self, rect, Color("e8e8d9"), 22)
-	var cells = EcoRules.board_cells(game.side)
-	var base_radius = 54.0
-	var minimum = Vector2(INF, INF)
-	var maximum = Vector2(-INF, -INF)
-	var projected: Dictionary = {}
-	for cell in cells:
-		var p = Vector2(1.5 * cell.x, sqrt(3.0) * (cell.y + cell.x * 0.5)) * base_radius
-		projected[cell] = p
-		minimum.x = minf(minimum.x, p.x - base_radius)
-		minimum.y = minf(minimum.y, p.y - base_radius * 0.9)
-		maximum.x = maxf(maximum.x, p.x + base_radius)
-		maximum.y = maxf(maximum.y, p.y + base_radius * 0.9)
-	var base_size = maximum - minimum
-	var scale_factor = minf(rect.size.x / base_size.x, rect.size.y / base_size.y)
-	scale_factor = minf(scale_factor, 1.15)
-	var origin = rect.position + (rect.size - base_size * scale_factor) * 0.5 - minimum * scale_factor
-	var radius = base_radius * scale_factor
-	var targets: Array = []
-	if mode == "cube" and selected_card_id > 0:
-		targets = game.available_cube_cells(selected_card_id)
-	var selected_token = ""
-	if not game.selected_tokens.is_empty():
-		selected_token_index = clampi(selected_token_index, 0, game.selected_tokens.size() - 1)
-		selected_token = game.selected_tokens[selected_token_index]
-	for cell in cells:
-		var center: Vector2 = origin + projected[cell] * scale_factor
-		cell_regions[cell] = Rect2(center - Vector2(maxf(radius * 0.86, 22), maxf(radius * 0.8, 22)), Vector2(maxf(radius * 1.72, 44), maxf(radius * 1.6, 44)))
-		EcoArt.hex(self, center + Vector2(0, radius * 0.1), radius * 0.94, Color("c5c9b8"))
-		EcoArt.hex(self, center, radius * 0.92, Color("f4f1e5"), Color("cbd0bd"), maxf(1.0, scale_factor * 1.5))
-		var stack: Array = game.board[cell]
-		for i in range(stack.size()):
-			EcoArt.token(self, stack[i], center - Vector2(0, i * radius * 0.13), radius * 0.85)
-		if game.cubes.has(cell):
-			var cube_center = center - Vector2(0, maxf(0, stack.size() - 1) * radius * 0.13 + radius * 0.25)
-			EcoArt.cube(self, cube_center, int(game.cubes[cell]) > 32, scale_factor)
-		var legal = false
-		var highlight = EcoArt.GREEN
-		if not selected_token.is_empty() and mode == "token":
-			legal = EcoRules.can_place(game.board, game.cubes, cell, selected_token)
-		elif targets.has(cell):
-			legal = true
-			highlight = EcoArt.GOLD
-		if legal:
-			var pulse = 0.65 + sin(clock * 5.0) * 0.2
-			EcoArt.hex(self, center, radius * 0.94, Color(0, 0, 0, 0), Color(highlight, pulse), maxf(3.0, radius * 0.07))
-	for item in animations:
-		if item.has("cell"):
-			var center: Vector2 = origin + projected[item.cell] * scale_factor
-			var progress: float = item.age / 0.7
-			draw_arc(center, radius * (0.4 + progress), 0, TAU, 32, Color(EcoArt.GOLD, 1.0 - progress), 3.0, true)
-
-func _draw_market(rect: Rect2) -> void:
-	_heading("TOKEN MARKET  ·  CHOOSE ONE GROUP", rect.position + Vector2(4, 14), 12)
-	market_regions.clear()
-	var gap = 8.0
-	var group_width = (rect.size.x - gap * 2) / 3.0
-	for i in range(3):
-		var group_rect = Rect2(rect.position + Vector2(i * (group_width + gap), 24), Vector2(group_width, rect.size.y - 28))
-		market_regions.append(group_rect)
-		var selected = game.selected_group == i
-		var unavailable = game.selected_group >= 0 and not selected
-		var fill = Color("dce9d7") if selected else Color(1, 1, 1, 0.62)
-		if unavailable:
-			fill = Color(0.85, 0.86, 0.82, 0.38)
-		EcoArt.rounded(self, group_rect, fill, 12, EcoArt.GREEN if selected else Color("d4d9ca"), 2 if selected else 1)
-		var tokens: Array = game.market[i] if i < game.market.size() else []
-		var radius = minf(23.0, group_width / 7.2)
-		for j in range(tokens.size()):
-			var center = group_rect.position + Vector2(group_width * (j + 0.5) / 3.0, group_rect.size.y * 0.52)
-			EcoArt.token(self, tokens[j], center, radius, selected)
-			if unavailable:
-				draw_circle(center, radius, Color(0.9, 0.9, 0.85, 0.45))
-
-func _draw_faceup(rect: Rect2) -> void:
-	_heading("ANIMAL CARDS  ·  DRAFT UP TO ONE EACH TURN", rect.position + Vector2(4, 13), 11)
-	faceup_regions.clear()
-	var gap = 8.0
-	var card_width = (rect.size.x - gap * 2) / 3.0
-	for i in range(game.faceup.size()):
-		var card_rect = Rect2(rect.position + Vector2(i * (card_width + gap), 22), Vector2(card_width, rect.size.y - 24))
-		faceup_regions.append(card_rect)
-		var data: Dictionary = game.faceup[i]
-		if data.is_empty():
-			EcoArt.rounded(self, card_rect, Color("e0e2d7"), 10)
-			EcoArt.text_center(self, "DECK EMPTY", card_rect.get_center(), 11, EcoArt.MUTED)
-			continue
-		_draw_small_card(data, card_rect, mode == "refresh")
-
-func _draw_small_card(data: Dictionary, rect: Rect2, highlighted: bool = false) -> void:
-	EcoArt.rounded(self, Rect2(rect.position + Vector2(0, 3), rect.size), Color(0.1, 0.17, 0.13, 0.15), 10)
-	EcoArt.rounded(self, rect, EcoArt.PAPER, 10, EcoArt.GOLD if highlighted else Color("d2d7c8"), 2 if highlighted else 1)
-	EcoArt.rounded(self, Rect2(rect.position, Vector2(rect.size.x, 28)), EcoArt.GREEN, 9)
-	EcoArt.fitted_text(self, data.name.to_upper(), Rect2(rect.position + Vector2(5, 5), Vector2(rect.size.x - 10, 18)), 12, Color.WHITE, true)
-	EcoArt.pattern(self, data, rect.position + Vector2(rect.size.x * 0.5, rect.size.y * 0.54), minf(12.0, rect.size.x * 0.09))
-	var scores = "/".join(data.scores.map(func(value): return str(value)))
-	EcoArt.fitted_text(self, scores, Rect2(rect.position + Vector2(5, rect.size.y - 18), Vector2(rect.size.x - 10, 13)), 11, EcoArt.MUTED, true)
-
-func _draw_active(rect: Rect2) -> void:
-	var cards: Array = []
-	if not game.spirit.is_empty() and int(game.spirit.get("cubes", 0)) == 0:
-		cards.append(game.spirit)
-	var completed = 0
-	for card in game.acquired:
-		if int(card.cubes) < card.scores.size():
-			cards.append(card)
-		else:
-			completed += 1
-	_heading("YOUR HABITATS  ·  %d/4" % game.active_count(), rect.position + Vector2(4, 13), 11)
-	if completed > 0:
-		EcoArt.text(self, "%d COMPLETE" % completed, rect.position + Vector2(rect.size.x - 100, 13), 10, EcoArt.MUTED)
-	active_regions.clear()
-	if cards.is_empty():
-		EcoArt.rounded(self, Rect2(rect.position + Vector2(0, 21), Vector2(rect.size.x, rect.size.y - 23)), Color(1, 1, 1, 0.38), 10)
-		EcoArt.text_center(self, "Draft an animal card to start building habitats", rect.position + Vector2(rect.size.x * 0.5, 58), 14, EcoArt.MUTED)
-		return
-	var gap = 7.0
-	var card_width = minf(170.0, (rect.size.x - gap * (cards.size() - 1)) / cards.size())
-	var total_width = card_width * cards.size() + gap * (cards.size() - 1)
-	var start_x = rect.position.x + maxf(0, (rect.size.x - total_width) * 0.5)
-	for i in range(cards.size()):
-		var data: Dictionary = cards[i]
-		var card_rect = Rect2(start_x + i * (card_width + gap), rect.position.y + 21, card_width, rect.size.y - 23)
-		active_regions[int(data.id)] = card_rect
-		var available = game.available_cube_cells(int(data.id)).size()
-		var selected = mode == "cube" and selected_card_id == int(data.id)
-		EcoArt.rounded(self, card_rect, Color("e5eee0") if available > 0 else EcoArt.PAPER, 10, EcoArt.GOLD if selected else (EcoArt.GREEN if available > 0 else Color("d3d8ca")), 2)
-		EcoArt.text(self, data.name.left(2).to_upper(), card_rect.position + Vector2(9, 28), 17, EcoArt.GREEN)
-		EcoArt.fitted_text(self, data.name, Rect2(card_rect.position + Vector2(36, 9), Vector2(card_rect.size.x - 43, 22)), 13, EcoArt.INK)
-		var max_cubes = 1 if data.kind == "spirit" else data.scores.size()
-		for pip in range(max_cubes):
-			var p = card_rect.position + Vector2(12 + pip * 14, card_rect.size.y - 16)
-			draw_circle(p, 4.5, EcoArt.GOLD if pip < int(data.get("cubes", 0)) else Color("d1d6ca"))
-		if available > 0:
-			EcoArt.text_center(self, "PLACE CUBE", card_rect.position + Vector2(card_rect.size.x * 0.5, card_rect.size.y - 34), 10, EcoArt.GREEN)
-
-func _draw_turn_controls(rect: Rect2, portrait: bool) -> void:
-	EcoArt.rounded(self, rect, Color(1, 1, 1, 0.5), 14)
-	var end_enabled = game.selected_group >= 0 and game.selected_tokens.is_empty() and not game.ended
-	if portrait:
-		var end_rect = Rect2(rect.end.x - 116, rect.position.y + 6, 112, 48)
-		_button("end_turn", end_rect, "END TURN", "gold", end_enabled, 14)
-		if not game.drafted and not game.refreshed and not game.deck.is_empty():
-			_button("refresh", Rect2(end_rect.position.x - 50, rect.position.y + 6, 46, 48), "NEW", "ghost", true, 10)
-		if game.selected_group < 0:
-			EcoArt.fitted_text(self, "Choose one market group", Rect2(rect.position + Vector2(12, 18), Vector2(rect.size.x - 190, 26)), 14, EcoArt.MUTED)
-		elif not game.selected_tokens.is_empty():
-			_draw_selected_tokens(Rect2(rect.position + Vector2(8, 5), Vector2(rect.size.x - 184, 50)))
-		else:
-			EcoArt.fitted_text(self, "Place cubes or end your turn", Rect2(rect.position + Vector2(12, 18), Vector2(rect.size.x - 184, 26)), 13, EcoArt.MUTED)
-	else:
-		var message = "Choose one group of three tokens."
-		if mode == "cube":
-			message = "Tap a gold highlighted space to place your cube."
-		elif game.selected_group >= 0 and not game.selected_tokens.is_empty():
-			message = "Place all three tokens. Tap a token below to change its order."
-		elif game.selected_group >= 0:
-			message = "You may place habitat cubes, then end the turn."
-		EcoArt.wrapped_text(self, message, Rect2(rect.position + Vector2(12, 8), Vector2(rect.size.x - 24, 58)), 14, EcoArt.MUTED)
-		if not game.selected_tokens.is_empty():
-			_draw_selected_tokens(Rect2(rect.position + Vector2(10, 66), Vector2(rect.size.x - 20, 54)))
-		var button_y = rect.end.y - 54
-		_button("end_turn", Rect2(rect.end.x - 154, button_y, 144, 46), "END TURN", "gold", end_enabled, 15)
-		if not game.drafted and not game.refreshed and not game.deck.is_empty():
-			_button("refresh", Rect2(rect.end.x - 268, button_y, 104, 46), "NEW CARD", "ghost", true, 12)
-
-func _draw_selected_tokens(rect: Rect2) -> void:
-	var count = game.selected_tokens.size()
-	var chip_width = minf(70, rect.size.x / maxf(1, count))
-	for i in range(count):
-		var chip = Rect2(rect.position + Vector2(i * chip_width, 0), Vector2(chip_width - 5, rect.size.y))
-		buttons["token_%d" % i] = chip
-		if mode == "token" and selected_token_index == i:
-			EcoArt.rounded(self, chip, Color("dce9d7"), 10, EcoArt.GREEN, 2)
-		EcoArt.token(self, game.selected_tokens[i], chip.get_center(), minf(20, chip.size.y * 0.38), mode == "token" and selected_token_index == i)
-
-func _draw_results() -> void:
-	var size = get_viewport_rect().size
-	var result = game.score()
-	var portrait = size.y > size.x
-	if not portrait and size.y < 500:
-		_draw_results_compact(result)
-		return
-	EcoArt.text_center(self, "YOUR ECOSYSTEM", Vector2(size.x * 0.5, 64), 16, EcoArt.MUTED)
-	EcoArt.text_center(self, str(result.total), Vector2(size.x * 0.5, 142), 72, EcoArt.GREEN)
-	EcoArt.text_center(self, "POINTS", Vector2(size.x * 0.5, 172), 14, EcoArt.MUTED)
-	var sun_count = int(result.suns)
-	var sun_spacing = 30.0
-	var sun_start = size.x * 0.5 - (sun_count - 1) * sun_spacing * 0.5
-	for i in range(sun_count):
-		var p = Vector2(sun_start + i * sun_spacing, 207)
-		draw_circle(p, 10, EcoArt.GOLD)
-		for ray in range(8):
-			var direction = Vector2.from_angle(ray * TAU / 8.0)
-			draw_line(p + direction * 13, p + direction * 17, EcoArt.GOLD, 2, true)
-	EcoArt.text_center(self, "%d SUNS  ·  %d FROM SCORE + %d CONFIGURATION" % [result.suns, result.base_suns, result.configuration], Vector2(size.x * 0.5, 243), 13, EcoArt.MUTED)
-	var panel = Rect2(20, 270, size.x - 40, maxf(190, size.y - 382))
-	EcoArt.rounded(self, panel, Color(1, 1, 1, 0.62), 20)
-	var labels = [["trees", "Trees"], ["mountains", "Mountains"], ["fields", "Fields"], ["buildings", "Buildings"], ["water", "Water / islands"], ["animals", "Animal cards"], ["spirit", "Nature’s Spirit"]]
-	if portrait:
-		for i in range(labels.size()):
-			var y = panel.position.y + 34 + i * 34
-			EcoArt.text(self, labels[i][1], Vector2(panel.position.x + 22, y), 17, EcoArt.INK)
-			EcoArt.text(self, str(result[labels[i][0]]), Vector2(panel.end.x - 58, y), 18, EcoArt.GREEN)
-	else:
-		var column_width = panel.size.x * 0.5
-		for i in range(labels.size()):
-			var column = 0 if i < 4 else 1
-			var row = i if i < 4 else i - 4
-			var x = panel.position.x + 26 + column * column_width
-			var y = panel.position.y + 42 + row * 48
-			EcoArt.text(self, labels[i][1], Vector2(x, y), 18, EcoArt.INK)
-			EcoArt.text(self, str(result[labels[i][0]]), Vector2(x + column_width - 68, y), 20, EcoArt.GREEN)
-	var button_width = minf(240, (size.x - 58) * 0.5)
-	_button("restart", Rect2(size.x * 0.5 - button_width - 7, size.y - 86, button_width, 56), "PLAY AGAIN", "primary")
-	_button("home", Rect2(size.x * 0.5 + 7, size.y - 86, button_width, 56), "MAIN MENU", "secondary")
-	EcoArt.text_center(self, game.end_reason, Vector2(size.x * 0.5, size.y - 102), 12, EcoArt.MUTED)
-
-func _draw_records() -> void:
-	var size = get_viewport_rect().size
-	EcoArt.text_center(self, "LOCAL RECORDS", Vector2(size.x * 0.5, 66), 32, EcoArt.INK)
-	EcoArt.text_center(self, "Stored only on this device", Vector2(size.x * 0.5, 94), 14, EcoArt.MUTED)
-	var width = minf(700, size.x - 36)
-	var x = (size.x - width) * 0.5
-	var card_width = (width - 14) * 0.5
-	for i in range(2):
-		var side = ["A", "B"][i]
-		var data: Dictionary = records[side]
-		var rect = Rect2(x + i * (card_width + 14), 122, card_width, 142)
-		EcoArt.rounded(self, rect, Color(1, 1, 1, 0.65), 18)
-		EcoArt.text_center(self, "SIDE " + side, rect.position + Vector2(rect.size.x * 0.5, 30), 15, EcoArt.MUTED)
-		EcoArt.text_center(self, str(data.get("best_score", 0)), rect.position + Vector2(rect.size.x * 0.5, 80), 42, EcoArt.GREEN)
-		EcoArt.text_center(self, "BEST  ·  %d SUNS  ·  %d GAMES" % [int(data.get("best_suns", 0)), int(data.get("games", 0))], rect.position + Vector2(rect.size.x * 0.5, 113), 11, EcoArt.MUTED)
-	_heading("RECENT ECOSYSTEMS", Vector2(x + 4, 306), 13)
-	var history: Array = records.history
-	if history.is_empty():
-		EcoArt.rounded(self, Rect2(x, 326, width, 116), Color(1, 1, 1, 0.45), 16)
-		EcoArt.text_center(self, "Complete a solo game to grow your records.", Vector2(size.x * 0.5, 390), 16, EcoArt.MUTED)
-	else:
-		for i in range(history.size()):
-			var item: Dictionary = history[i]
-			var rect = Rect2(x, 322 + i * 52, width, 44)
-			EcoArt.rounded(self, rect, Color(1, 1, 1, 0.5), 10)
-			EcoArt.text(self, "SIDE " + str(item.get("side", "A")), rect.position + Vector2(16, 28), 14, EcoArt.MUTED)
-			EcoArt.text(self, "%d points" % int(item.get("score", 0)), rect.position + Vector2(width * 0.38, 28), 16, EcoArt.INK)
-			EcoArt.text(self, "%d suns" % int(item.get("suns", 0)), rect.position + Vector2(width * 0.72, 28), 16, EcoArt.GOLD)
-	_button("home", Rect2(size.x * 0.5 - 110, size.y - 76, 220, 50), "BACK", "secondary")
-
-func _draw_help() -> void:
-	var size = get_viewport_rect().size
-	var width = minf(760, size.x - 34)
-	var rect = Rect2((size.x - width) * 0.5, 28, width, size.y - 112)
-	EcoArt.rounded(self, rect, Color(1, 1, 1, 0.7), 22)
-	var titles = ["BUILD YOUR LANDSCAPE", "WELCOME WILDLIFE", "SCORE & SOLO SUNS"]
-	EcoArt.text_center(self, titles[help_page], Vector2(size.x * 0.5, rect.position.y + 48), 25, EcoArt.GREEN)
-	var content: Array = []
-	if help_page == 0:
-		content = [
-			["1", "Choose one market group", "Take all three tokens from one group. The other six tokens leave the game when you end the turn."],
-			["2", "Place them in any order", "Tap a selected token, then a highlighted board space. You may draft or place cubes between token placements."],
-			["3", "Stack with care", "Mountains stack to 3 on mountains. Trunks stack to 2; foliage goes on trunks. Buildings reach height 2 on mountains, trunks, or buildings. Water and fields never stack."],
-			["4", "End the turn", "After placing all three tokens, place any habitat cubes and end your turn. The market refills with nine new tokens."]
-		]
-	elif help_page == 1:
-		content = [
-			["A", "Draft animal cards", "Take at most one face-up card each turn. You may hold four incomplete cards, including an incomplete Nature’s Spirit."],
-			["B", "Match the habitat", "Patterns may rotate through six directions, but never mirror. Heights must match exactly. Building bases may be any legal color."],
-			["C", "Place cubes", "Tap one of your cards, then a highlighted cube target. One cube fits per space; tokens already used in a habitat can still score in others."],
-			["D", "Refresh if you skip", "If you have not drafted this turn, NEW CARD lets you replace one face-up animal before ending the turn."]
-		]
-	else:
-		content = [
-			["T", "Landscape scoring", "Trees and connected mountains score 1 / 3 / 7 by height. Field groups of 2+ and qualifying height-2 buildings score 5. Side A scores the longest river; Side B scores separate land areas."],
-			["A", "Animal scoring", "Each new cube moves a card up its score ladder. A completed card leaves your four-card hand and is scored at the end."],
-			["S", "Nature’s Spirit", "Choose one of two spirits, or play without one. Its habitat cube activates its special scoring rule."],
-			["☀", "Solo suns", "Score thresholds award up to 8 suns. Side A adds 1. No spirit adds 2; a completed group-scoring spirit adds 1. The game ends when the pouch cannot refill or at most two spaces remain."]
-		]
-	var y = rect.position.y + 82
-	var row_height = minf(104, (rect.size.y - 100) / 4.0)
-	for item in content:
-		draw_circle(Vector2(rect.position.x + 38, y + 20), 17, EcoArt.LIGHT_GREEN)
-		EcoArt.text_center(self, item[0], Vector2(rect.position.x + 38, y + 26), 15, EcoArt.GREEN)
-		EcoArt.text(self, item[1], Vector2(rect.position.x + 68, y + 18), 17, EcoArt.INK)
-		EcoArt.wrapped_text(self, item[2], Rect2(rect.position.x + 68, y + 26, rect.size.x - 92, row_height - 30), 14, EcoArt.MUTED)
-		y += row_height
-	for i in range(3):
-		draw_circle(Vector2(size.x * 0.5 + (i - 1) * 20, rect.end.y - 22), 4, EcoArt.GREEN if i == help_page else Color("c2cbbd"))
-	_button("help_prev", Rect2(20, size.y - 68, 110, 46), "BACK", "ghost", help_page > 0, 14)
-	_button("home", Rect2(size.x * 0.5 - 70, size.y - 68, 140, 46), "DONE", "secondary", true, 14)
-	_button("help_next", Rect2(size.x - 130, size.y - 68, 110, 46), "NEXT", "primary", help_page < 2, 14)
-
-func _draw_overlay() -> void:
-	var size = get_viewport_rect().size
-	draw_rect(Rect2(Vector2.ZERO, size), Color(0.06, 0.12, 0.1, 0.68))
-	match overlay:
-		"pause":
-			var pause_height = minf(440, size.y - 24)
-			var rect = Rect2(size.x * 0.5 - 190, (size.y - pause_height) * 0.5, 380, pause_height)
-			EcoArt.rounded(self, rect, EcoArt.CREAM, 24)
-			EcoArt.text_center(self, "PAUSED", Vector2(size.x * 0.5, rect.position.y + 58), 30, EcoArt.INK)
-			_button("resume", Rect2(rect.position + Vector2(34, 92), Vector2(312, 54)), "RESUME")
-			_button("restart", Rect2(rect.position + Vector2(34, 158), Vector2(312, 54)), "RESTART", "secondary")
-			_button("sound", Rect2(rect.position + Vector2(34, 224), Vector2(312, 50)), "SOUND  ·  " + ("ON" if sound_enabled else "OFF"), "ghost", true, 15)
-			_button("home", Rect2(rect.position + Vector2(34, 288), Vector2(312, 54)), "MAIN MENU", "ghost")
-		"spirit":
-			_draw_spirit_choice()
-		"detail":
-			_draw_card_detail()
-
-func _draw_spirit_choice() -> void:
-	var size = get_viewport_rect().size
-	var panel = Rect2(16, 24, size.x - 32, size.y - 48)
-	EcoArt.rounded(self, panel, EcoArt.CREAM, 24)
-	EcoArt.text_center(self, "CHOOSE YOUR NATURE’S SPIRIT", Vector2(size.x * 0.5, panel.position.y + 48), 24, EcoArt.GREEN)
-	EcoArt.text_center(self, "Its habitat cube activates a unique scoring rule.", Vector2(size.x * 0.5, panel.position.y + 76), 14, EcoArt.MUTED)
-	var card_area = Rect2(panel.position + Vector2(20, 100), Vector2(panel.size.x - 40, panel.size.y - 122))
-	var gap = 18.0
-	var card_width = minf(310, (card_area.size.x - gap) * 0.5)
-	var total = card_width * 2 + gap
-	for i in range(2):
-		var data: Dictionary = game.spirit_options[i]
-		var rect = Rect2(card_area.position.x + (card_area.size.x - total) * 0.5 + i * (card_width + gap), card_area.position.y, card_width, card_area.size.y)
-		EcoArt.rounded(self, rect, EcoArt.PAPER, 16, EcoArt.GOLD, 2)
-		EcoArt.text_center(self, data.name.to_upper(), rect.position + Vector2(rect.size.x * 0.5, 38), 21, EcoArt.GREEN)
-		EcoArt.pattern(self, data, rect.position + Vector2(rect.size.x * 0.5, rect.size.y * 0.32), minf(28, rect.size.x * 0.09))
-		EcoArt.wrapped_text(self, data.rule, Rect2(rect.position + Vector2(18, rect.size.y * 0.52), Vector2(rect.size.x - 36, rect.size.y * 0.23)), 15, EcoArt.INK)
-		_button("spirit_%d" % i, Rect2(rect.position + Vector2(16, rect.size.y - 64), Vector2(rect.size.x - 32, 48)), "CHOOSE", "primary", true, 15)
-
-func _draw_card_detail() -> void:
-	if detail_card.is_empty():
-		return
-	var size = get_viewport_rect().size
-	var width = minf(410, size.x - 30)
-	var height = minf(590, size.y - 36)
-	var rect = Rect2((size.x - width) * 0.5, (size.y - height) * 0.5, width, height)
-	EcoArt.rounded(self, rect, EcoArt.PAPER, 20, EcoArt.GOLD if detail_card.kind == "spirit" else EcoArt.GREEN, 2)
-	EcoArt.text_center(self, detail_card.name.to_upper(), rect.position + Vector2(width * 0.5, 48), 25, EcoArt.GREEN)
-	EcoArt.text_center(self, "NATURE’S SPIRIT" if detail_card.kind == "spirit" else "ANIMAL HABITAT", rect.position + Vector2(width * 0.5, 74), 12, EcoArt.MUTED)
-	EcoArt.pattern(self, detail_card, rect.position + Vector2(width * 0.5, height * 0.32), minf(31, width * 0.075))
-	EcoArt.text_center(self, "Gold dot = cube target  ·  rotate, never mirror", rect.position + Vector2(width * 0.5, height * 0.51), 12, EcoArt.MUTED)
-	if detail_card.kind == "spirit":
-		EcoArt.wrapped_text(self, detail_card.rule, Rect2(rect.position + Vector2(28, height * 0.56), Vector2(width - 56, 100)), 17, EcoArt.INK)
-	else:
-		var score_text = "  ·  ".join(detail_card.scores.map(func(value): return str(value)))
-		EcoArt.text_center(self, score_text, rect.position + Vector2(width * 0.5, height * 0.59), 25, EcoArt.GOLD)
-		EcoArt.text_center(self, "Points increase with each cube placed", rect.position + Vector2(width * 0.5, height * 0.64), 13, EcoArt.MUTED)
-		if detail_card.has("cubes"):
-			EcoArt.text_center(self, "%d / %d cubes placed" % [int(detail_card.cubes), detail_card.scores.size()], rect.position + Vector2(width * 0.5, height * 0.7), 15, EcoArt.GREEN)
-	var button_rect = Rect2(rect.position + Vector2(24, height - 76), Vector2(width - 48, 50))
-	if detail_source.begins_with("market"):
-		var index = int(detail_source.get_slice(":", 1))
-		_button("draft", button_rect, "DRAFT CARD", "primary", game.can_draft(index))
-	elif detail_source == "active":
-		_button("find_habitat", button_rect, "FIND HABITAT", "gold", game.available_cube_cells(int(detail_card.id)).size() > 0)
-	else:
-		_button("close", button_rect, "CLOSE", "secondary")
-	_button("close", Rect2(rect.end.x - 56, rect.position.y + 12, 44, 44), "X", "ghost", true, 15)
-
-func _draw_toast() -> void:
-	var size = get_viewport_rect().size
-	var width = minf(480, size.x - 40)
-	var rect = Rect2((size.x - width) * 0.5, 72, width, 44)
-	EcoArt.rounded(self, rect, Color(0.12, 0.23, 0.19, 0.94), 14)
-	EcoArt.text_center(self, toast, rect.get_center() + Vector2(0, 5), 14, Color.WHITE)
-
-func _handle_click(position: Vector2) -> void:
-	for id in buttons.keys():
-		if buttons[id].has_point(position):
-			if disabled_buttons.has(id):
-				if id == "draft":
-					_show_toast("Draft limit reached or a card was already taken")
-				return
-			_activate(id)
-			return
-	if not overlay.is_empty():
-		return
-	if screen != "game" or game.ended:
-		return
-	for i in range(market_regions.size()):
-		if market_regions[i].has_point(position) and game.selected_group < 0:
-			if game.select_market(i):
-				mode = "token"
-				selected_token_index = 0
-				_play("tap")
-				_show_toast("Place all three tokens in any order")
-			return
-	for i in range(faceup_regions.size()):
-		if faceup_regions[i].has_point(position) and not game.faceup[i].is_empty():
-			if mode == "refresh":
-				if game.refresh_card(i):
-					mode = "token"
-					_play("tap")
-					_show_toast("Face-up animal replaced")
-				return
-			detail_card = game.faceup[i]
-			detail_source = "market:%d" % i
-			overlay = "detail"
-			_play("tap")
-			return
-	for card_id in active_regions.keys():
-		if active_regions[card_id].has_point(position):
-			var available = game.available_cube_cells(card_id)
-			if not available.is_empty():
-				selected_card_id = card_id
-				mode = "cube"
-				_play("tap")
-				_show_toast("Tap a gold space to place the habitat cube")
-			else:
-				detail_card = game.card_instance(card_id)
-				detail_source = "active"
-				overlay = "detail"
-				_play("tap")
-			return
-	for cell in cell_regions.keys():
-		if cell_regions[cell].has_point(position):
-			if mode == "cube" and selected_card_id > 0:
-				if game.place_cube(selected_card_id, cell):
-					animations.append({"cell": cell, "age": 0.0})
-					var card = game.card_instance(selected_card_id)
-					var complete = card.kind == "spirit" or int(card.cubes) >= card.scores.size()
-					_play("complete" if complete else "place")
-					if complete or game.available_cube_cells(selected_card_id).is_empty():
-						mode = "token"
-						selected_card_id = 0
-					_show_toast("Habitat complete!" if complete else "Animal cube placed")
-				else:
-					_show_toast("Choose a gold highlighted habitat target")
-				return
-			if not game.selected_tokens.is_empty():
-				selected_token_index = clampi(selected_token_index, 0, game.selected_tokens.size() - 1)
-				var placed = game.place_token(cell, selected_token_index)
-				if placed.is_empty():
-					_show_toast("That token cannot be placed on this space")
-					return
-				animations.append({"cell": cell, "age": 0.0})
-				_play("place")
-				selected_token_index = mini(selected_token_index, maxi(0, game.selected_tokens.size() - 1))
-				if game.selected_tokens.is_empty():
-					_show_toast("All tokens placed — draft, place cubes, or end turn")
-				elif not game.has_legal_token_placement():
-					game.finish_early()
-					_finish_game()
-				return
-			_show_toast("Choose a market group first")
-			return
-
-func _activate(id: String) -> void:
-	_play("tap")
-	match id:
-		"play_a": start_game("A")
-		"play_b": start_game("B")
-		"spirit":
-			spirit_enabled = not spirit_enabled
-		"sound":
-			sound_enabled = not sound_enabled
-			_save_settings()
-		"records": _change_screen("records")
-		"help":
-			help_page = 0
-			_change_screen("help")
-		"help_prev": help_page = maxi(0, help_page - 1)
-		"help_next": help_page = mini(2, help_page + 1)
-		"home": _change_screen("home")
-		"pause": overlay = "pause"
-		"resume": overlay = ""
-		"restart": start_game(game.side)
-		"close":
-			overlay = ""
-			detail_card = {}
-		"refresh":
-			mode = "refresh"
-			selected_card_id = 0
-			_show_toast("Tap one face-up animal to replace it")
-		"draft":
-			var index = int(detail_source.get_slice(":", 1))
-			if game.draft_card(index):
-				overlay = ""
-				detail_card = {}
-				_show_toast("Animal added to your habitats")
-		"find_habitat":
-			selected_card_id = int(detail_card.id)
-			mode = "cube"
-			overlay = ""
-			detail_card = {}
-			_show_toast("Tap a gold space to place the habitat cube")
-		"end_turn":
-			if game.end_turn():
-				mode = "token"
-				selected_card_id = 0
-				if game.ended:
-					_finish_game()
-				else:
-					_show_toast("Turn %d · choose a new token group" % game.turn)
-		_:
-			if id.begins_with("token_"):
-				selected_token_index = int(id.get_slice("_", 1))
-				mode = "token"
-				selected_card_id = 0
-			elif id.begins_with("spirit_"):
-				var index = int(id.get_slice("_", 1))
-				if game.choose_spirit(index):
-					overlay = ""
-					_show_toast("Choose a token group to begin")
-
-func _finish_game() -> void:
-	var result = game.score()
-	_change_screen("results")
-	_save_result(result)
-
-func _draw_results_compact(result: Dictionary) -> void:
-	var size = get_viewport_rect().size
-	var left_width = size.x * 0.33
-	EcoArt.text_center(self, "YOUR ECOSYSTEM", Vector2(left_width * 0.5, 42), 14, EcoArt.MUTED)
-	EcoArt.text_center(self, str(result.total), Vector2(left_width * 0.5, 112), 58, EcoArt.GREEN)
-	EcoArt.text_center(self, "POINTS", Vector2(left_width * 0.5, 139), 12, EcoArt.MUTED)
-	var sun_count = int(result.suns)
-	var spacing = 23.0
-	var start = left_width * 0.5 - (sun_count - 1) * spacing * 0.5
-	for i in range(sun_count):
-		var p = Vector2(start + i * spacing, 172)
-		draw_circle(p, 8, EcoArt.GOLD)
-		for ray in range(8):
-			var direction = Vector2.from_angle(ray * TAU / 8.0)
-			draw_line(p + direction * 10, p + direction * 13, EcoArt.GOLD, 1.5, true)
-	EcoArt.wrapped_text(self, "%d suns · %d score + %d configuration" % [result.suns, result.base_suns, result.configuration], Rect2(24, 196, left_width - 48, 52), 12, EcoArt.MUTED)
-	EcoArt.wrapped_text(self, game.end_reason, Rect2(24, 246, left_width - 48, 50), 11, EcoArt.MUTED)
-	var panel = Rect2(left_width + 6, 18, size.x - left_width - 24, size.y - 104)
-	EcoArt.rounded(self, panel, Color(1, 1, 1, 0.62), 18)
-	var labels = [["trees", "Trees"], ["mountains", "Mountains"], ["fields", "Fields"], ["buildings", "Buildings"], ["water", "Water / islands"], ["animals", "Animal cards"], ["spirit", "Nature’s Spirit"]]
-	for i in range(labels.size()):
-		var y = panel.position.y + 32 + i * 34
-		EcoArt.text(self, labels[i][1], panel.position + Vector2(22, 32 + i * 34), 15, EcoArt.INK)
-		EcoArt.text(self, str(result[labels[i][0]]), Vector2(panel.end.x - 48, y), 16, EcoArt.GREEN)
-	var button_width = minf(220, (size.x - 58) * 0.5)
-	_button("restart", Rect2(size.x * 0.5 - button_width - 7, size.y - 66, button_width, 48), "PLAY AGAIN", "primary", true, 15)
-	_button("home", Rect2(size.x * 0.5 + 7, size.y - 66, button_width, 48), "MAIN MENU", "secondary", true, 15)
-
-func _make_sound(sound_name: String) -> AudioStreamWAV:
-	var duration = 0.11
-	var notes = [520.0, 680.0]
-	var volume = 0.12
-	match sound_name:
-		"place":
-			duration = 0.22
-			notes = [260.0, 390.0, 520.0]
-			volume = 0.18
-		"complete":
-			duration = 0.65
-			notes = [392.0, 493.88, 587.33, 783.99]
-			volume = 0.16
-		"finish":
-			duration = 1.25
-			notes = [261.63, 329.63, 392.0, 523.25, 659.25]
-			volume = 0.14
+func _tone(kind: String) -> AudioStreamWAV:
 	var rate = 22050
-	var sample_count = int(duration * rate)
-	var bytes = PackedByteArray()
-	bytes.resize(sample_count * 2)
-	for i in range(sample_count):
+	var duration = 0.08 if kind == "tap" else (0.18 if kind == "place" else 0.32)
+	var count = int(rate * duration)
+	var data = PackedByteArray()
+	data.resize(count * 2)
+	for i in range(count):
 		var t = float(i) / rate
-		var value = 0.0
-		for j in range(notes.size()):
-			var start = j * duration / (notes.size() + 1)
-			var local = t - start
-			if local >= 0:
-				var envelope = exp(-local * (8.0 if sound_name == "tap" else 4.5)) * minf(1.0, local * 80.0)
-				value += sin(TAU * notes[j] * local) * envelope
-				value += 0.22 * sin(TAU * notes[j] * 2.0 * local) * envelope
-		var fade_out = minf(t / 0.008, (duration - t) / 0.035)
-		var sample = int(clampf(value * volume * minf(1.0, fade_out) / notes.size() * 2.2, -1.0, 1.0) * 32767.0)
-		bytes[i * 2] = sample & 0xff
-		bytes[i * 2 + 1] = (sample >> 8) & 0xff
-	var stream = AudioStreamWAV.new()
-	stream.format = AudioStreamWAV.FORMAT_16_BITS
-	stream.mix_rate = rate
-	stream.stereo = false
-	stream.data = bytes
-	return stream
+		var envelope = pow(1.0 - float(i) / count, 2)
+		var frequency = 440.0
+		if kind == "place": frequency = 240.0 + t * 500
+		elif kind == "success": frequency = 520.0 + floor(t * 12) * 65
+		elif kind == "error": frequency = 150.0
+		var sample = int(sin(TAU * frequency * t) * envelope * 5500)
+		data.encode_s16(i * 2, sample)
+	var wav = AudioStreamWAV.new()
+	wav.format = AudioStreamWAV.FORMAT_16_BITS
+	wav.mix_rate = rate
+	wav.data = data
+	return wav
+
+func _play(kind: String) -> void:
+	if sound_enabled and audio.has(kind):
+		audio[kind].play()
+
