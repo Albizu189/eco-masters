@@ -1,6 +1,9 @@
 class_name EcoGame
 extends RefCounted
 
+const SAVE_VERSION = 2
+const MAX_UNDO_STEPS = 32
+
 var side = "A"
 var board: Dictionary = {}
 var cubes: Dictionary = {}
@@ -20,6 +23,7 @@ var refreshed = false
 var ended = false
 var end_reason = ""
 var rng = RandomNumberGenerator.new()
+var history: Array = []
 
 func new_game(board_side: String = "A", with_spirit: bool = true, seed_value: int = -1) -> void:
 	side = board_side
@@ -33,6 +37,7 @@ func new_game(board_side: String = "A", with_spirit: bool = true, seed_value: in
 	acquired.clear()
 	spirit.clear()
 	spirit_options.clear()
+	history.clear()
 	turn = 1
 	selected_group = -1
 	selected_tokens.clear()
@@ -81,9 +86,15 @@ func _draw_animal() -> Dictionary:
 		return {}
 	return deck.pop_back()
 
+func _push_history() -> void:
+	history.append(snapshot())
+	if history.size() > MAX_UNDO_STEPS:
+		history.pop_front()
+
 func choose_spirit(index: int) -> bool:
 	if not spirit_enabled or not spirit.is_empty() or index < 0 or index >= spirit_options.size():
 		return false
+	_push_history()
 	spirit = spirit_options[index].duplicate(true)
 	spirit["cubes"] = 0
 	spirit_options.clear()
@@ -104,6 +115,7 @@ func can_draft(index: int) -> bool:
 func draft_card(index: int) -> bool:
 	if not can_draft(index):
 		return false
+	_push_history()
 	var card: Dictionary = faceup[index]
 	card["cubes"] = 0
 	acquired.append(card)
@@ -114,6 +126,7 @@ func draft_card(index: int) -> bool:
 func refresh_card(index: int) -> bool:
 	if ended or drafted or refreshed or index < 0 or index >= faceup.size() or faceup[index].is_empty() or deck.is_empty():
 		return false
+	_push_history()
 	faceup[index] = _draw_animal()
 	refreshed = true
 	return true
@@ -121,6 +134,7 @@ func refresh_card(index: int) -> bool:
 func select_market(index: int) -> bool:
 	if ended or selected_group >= 0 or index < 0 or index >= market.size():
 		return false
+	_push_history()
 	selected_group = index
 	selected_tokens = market[index].duplicate()
 	return true
@@ -131,6 +145,7 @@ func place_token(cell: Vector2i, token_index: int) -> String:
 	var token: String = selected_tokens[token_index]
 	if not EcoRules.can_place(board, cubes, cell, token):
 		return ""
+	_push_history()
 	board[cell].append(token)
 	selected_tokens.remove_at(token_index)
 	return token
@@ -156,10 +171,21 @@ func available_cube_cells(card_id: int) -> Array:
 func place_cube(card_id: int, cell: Vector2i) -> bool:
 	if not available_cube_cells(card_id).has(cell):
 		return false
+	_push_history()
 	var card = card_instance(card_id)
 	card["cubes"] = int(card.get("cubes", 0)) + 1
 	cubes[cell] = card_id
 	return true
+
+func undo() -> bool:
+	if ended or history.is_empty():
+		return false
+	var previous: Dictionary = history.pop_back()
+	restore_snapshot(previous)
+	return true
+
+func can_undo() -> bool:
+	return not ended and not history.is_empty()
 
 func empty_cells() -> int:
 	var count = 0
@@ -183,6 +209,7 @@ func end_turn() -> bool:
 	turn += 1
 	drafted = false
 	refreshed = false
+	history.clear()
 	if bag.size() < 9:
 		ended = true
 		end_reason = "The token pouch cannot refill the market."
@@ -200,3 +227,105 @@ func finish_early() -> void:
 
 func score() -> Dictionary:
 	return EcoRules.score_game(board, side, acquired, spirit)
+
+func card_points(card: Dictionary) -> int:
+	if card.is_empty():
+		return 0
+	if card.kind == "spirit":
+		return int(score().spirit) if not spirit.is_empty() and int(spirit.id) == int(card.id) else 0
+	var count = clampi(int(card.get("cubes", 0)), 0, card.scores.size())
+	return int(card.scores[count - 1]) if count > 0 else 0
+
+func snapshot() -> Dictionary:
+	return {
+		"save_version": SAVE_VERSION,
+		"side": side,
+		"board": _encode_board(),
+		"cubes": _encode_cubes(),
+		"bag": bag.duplicate(true),
+		"deck": deck.duplicate(true),
+		"market": market.duplicate(true),
+		"faceup": faceup.duplicate(true),
+		"acquired": acquired.duplicate(true),
+		"spirit": spirit.duplicate(true),
+		"spirit_options": spirit_options.duplicate(true),
+		"spirit_enabled": spirit_enabled,
+		"turn": turn,
+		"selected_group": selected_group,
+		"selected_tokens": selected_tokens.duplicate(),
+		"drafted": drafted,
+		"refreshed": refreshed,
+		"ended": ended,
+		"end_reason": end_reason,
+		"rng_state": str(rng.state)
+	}
+
+func to_dict() -> Dictionary:
+	var data = snapshot()
+	data["history"] = history.duplicate(true)
+	return data
+
+func load_dict(data: Dictionary) -> bool:
+	if int(data.get("save_version", 0)) != SAVE_VERSION:
+		return false
+	if not data.get("side", "") in ["A", "B"] or not data.get("board") is Array or not data.get("cubes") is Array:
+		return false
+	var restored_board = _decode_board(data.board)
+	if restored_board.size() != 25:
+		return false
+	restore_snapshot(data)
+	history.clear()
+	var saved_history = data.get("history", [])
+	if saved_history is Array:
+		for item in saved_history:
+			if item is Dictionary and item.get("board") is Array:
+				history.append(item.duplicate(true))
+	return true
+
+func restore_snapshot(data: Dictionary) -> void:
+	side = str(data.get("side", "A"))
+	board = _decode_board(data.get("board", []))
+	cubes = _decode_cubes(data.get("cubes", []))
+	bag = data.get("bag", []).duplicate(true)
+	deck = data.get("deck", []).duplicate(true)
+	market = data.get("market", []).duplicate(true)
+	faceup = data.get("faceup", []).duplicate(true)
+	acquired = data.get("acquired", []).duplicate(true)
+	spirit = data.get("spirit", {}).duplicate(true)
+	spirit_options = data.get("spirit_options", []).duplicate(true)
+	spirit_enabled = bool(data.get("spirit_enabled", true))
+	turn = int(data.get("turn", 1))
+	selected_group = int(data.get("selected_group", -1))
+	selected_tokens = data.get("selected_tokens", []).duplicate()
+	drafted = bool(data.get("drafted", false))
+	refreshed = bool(data.get("refreshed", false))
+	ended = bool(data.get("ended", false))
+	end_reason = str(data.get("end_reason", ""))
+	rng.state = int(str(data.get("rng_state", "1")))
+
+func _encode_board() -> Array:
+	var result: Array = []
+	for cell in board.keys():
+		result.append({"q": cell.x, "r": cell.y, "stack": board[cell].duplicate()})
+	return result
+
+func _decode_board(entries: Array) -> Dictionary:
+	var result: Dictionary = {}
+	for entry in entries:
+		if entry is Dictionary and entry.has("q") and entry.has("r") and entry.get("stack") is Array:
+			result[Vector2i(int(entry.q), int(entry.r))] = entry.stack.duplicate()
+	return result
+
+func _encode_cubes() -> Array:
+	var result: Array = []
+	for cell in cubes.keys():
+		result.append({"q": cell.x, "r": cell.y, "card": int(cubes[cell])})
+	return result
+
+func _decode_cubes(entries: Array) -> Dictionary:
+	var result: Dictionary = {}
+	for entry in entries:
+		if entry is Dictionary and entry.has("q") and entry.has("r"):
+			result[Vector2i(int(entry.q), int(entry.r))] = int(entry.get("card", 0))
+	return result
+

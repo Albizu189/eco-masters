@@ -1,6 +1,7 @@
 extends SceneTree
 
 var output_dir = "/mnt/agents/work/screenshots"
+var dark_capture = false
 
 func _initialize() -> void:
 	call_deferred("capture")
@@ -9,9 +10,14 @@ func capture() -> void:
 	for argument in OS.get_cmdline_user_args():
 		if argument.begins_with("--out="):
 			output_dir = argument.trim_prefix("--out=")
+		elif argument == "--dark":
+			dark_capture = true
 	DirAccess.make_dir_recursive_absolute(output_dir)
 	var scene = load("res://scenes/main.tscn").instantiate()
 	root.add_child(scene)
+	if dark_capture:
+		scene.dark_mode = true
+		EcoArt.set_dark_mode(true)
 	await settle()
 	scene.fade = 0
 	scene.toast_time = 0
@@ -60,3 +66,4 @@ func save_image(label: String) -> void:
 	var suffix = "%dx%d" % [int(root.size.x), int(root.size.y)]
 	var result = image.save_png(output_dir + "/" + label + "-" + suffix + ".png")
 	print("CAPTURE ", label, " ", suffix, " result=", result)
+
