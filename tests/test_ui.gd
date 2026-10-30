@@ -4,79 +4,127 @@ var failures = 0
 var checks = 0
 var scene
 
-func check(condition: bool, label: String) -> void:
-	checks += 1
-	if not condition:
-		failures += 1
-		printerr("UI FAIL: " + label)
-
 func _initialize() -> void:
 	call_deferred("run")
 
-func frames(count: int = 3) -> void:
-	for index in range(count):
+func check(condition: bool, message: String) -> void:
+	checks += 1
+	if not condition:
+		failures += 1
+		printerr("UI FAIL: ", message)
+
+func click(id: String) -> void:
+	await settle()
+	check(scene.buttons.has(id), "Button exists: " + id)
+	if scene.buttons.has(id):
+		var rect: Rect2 = scene.buttons[id]
+		scene._handle_click(rect.get_center())
+		await settle()
+
+func settle() -> void:
+	for i in range(4):
 		await process_frame
 
-func click(rect: Rect2) -> void:
-	scene._handle_click(rect.get_center())
-	await frames()
+func check_buttons(label: String) -> void:
+	var view = scene._view_size()
+	for id in scene.buttons.keys():
+		var rect: Rect2 = scene.buttons[id]
+		check(rect.size.x >= 44 and rect.size.y >= 44, "%s touch target %s is at least 44 logical px" % [label, id])
+		check(rect.position.x >= -0.1 and rect.position.y >= -0.1 and rect.end.x <= view.x + 0.1 and rect.end.y <= view.y + 0.1, "%s button %s stays on screen" % [label, id])
 
 func run() -> void:
 	scene = load("res://scenes/main.tscn").instantiate()
 	root.add_child(scene)
-	await frames(8)
-	check(scene.buttons.has("play_a"), "Home play button exists")
-	await click(scene.buttons.play_a)
-	check(scene.screen == "game" and scene.overlay == "spirit", "Play opens spirit choice")
-	await click(scene.buttons.spirit_0)
-	check(scene.overlay.is_empty() and not scene.game.spirit.is_empty(), "Spirit selected")
-	await click(scene.market_regions[0])
-	check(scene.game.selected_group == 0 and scene.game.selected_tokens.size() == 3, "Market group selected through hit region")
-	var placements = 0
-	while not scene.game.selected_tokens.is_empty() and placements < 3:
-		var acted = false
-		for cell in scene.cell_regions.keys():
-			if EcoRules.can_place(scene.game.board, scene.game.cubes, cell, scene.game.selected_tokens[scene.selected_token_index]):
-				await click(scene.cell_regions[cell])
-				acted = true
-				placements += 1
-				break
-		check(acted, "Legal token placement %d" % placements)
-	check(scene.game.selected_tokens.is_empty(), "All three tokens placed through board hit regions")
-	await click(scene.faceup_regions[0])
-	check(scene.overlay == "detail" and scene.buttons.has("draft"), "Face-up card opens draft detail")
-	await click(scene.buttons.draft)
-	check(scene.game.acquired.size() == 1 and scene.game.drafted, "Card drafted through detail button")
-	await click(scene.buttons.end_turn)
-	check(scene.game.turn == 2 and scene.game.selected_group == -1, "End turn refreshes solo market")
-	await click(scene.buttons.refresh)
-	await click(scene.faceup_regions[1])
-	check(scene.game.refreshed, "Skipped-draft card refresh works")
-	await click(scene.buttons.pause)
-	check(scene.overlay == "pause", "Pause opens")
-	await click(scene.buttons.resume)
-	check(scene.overlay.is_empty(), "Resume works")
-	await click(scene.buttons.pause)
-	await click(scene.buttons.home)
-	check(scene.screen == "home", "Pause returns to main menu")
-	await click(scene.buttons.help)
-	check(scene.screen == "help", "Help opens")
-	await click(scene.buttons.help_next)
-	await click(scene.buttons.help_next)
-	check(scene.help_page == 2, "Help paging works")
-	await click(scene.buttons.home)
-	await click(scene.buttons.records)
-	check(scene.screen == "records", "Records open")
-	await click(scene.buttons.home)
-	var sound_before = scene.sound_enabled
-	await click(scene.buttons.sound)
-	check(scene.sound_enabled != sound_before, "Sound toggle works")
-	for id in scene.buttons.keys():
-		var rect: Rect2 = scene.buttons[id]
-		check(rect.size.x >= 44 and rect.size.y >= 44, "Touch target %s is at least 44 px" % id)
-	for player in scene.audio.values():
-		player.stop()
+	await settle()
+	check(scene.regular != null and scene.bold != null, "Bundled fonts loaded")
+	check(scene.screen == "home", "Home shown")
+	check(scene.ui_scale >= 1.0, "Responsive UI scale initialized")
+	check_buttons("home")
+	await click("dark")
+	check(scene.dark_mode, "Dark mode toggles on")
+	await click("dark")
+	check(not scene.dark_mode, "Dark mode toggles off")
+	await click("new")
+	check(scene.screen == "setup", "Setup shown")
+	check_buttons("setup")
+	await click("spirit_toggle")
+	await click("begin")
+	check(scene.screen == "game" and not scene.game.spirit_enabled, "Game starts without spirit")
+	check(scene.game.market.size() == 3 and scene.game.faceup.size() == 3, "Market and cards drawn")
+	check_buttons("game")
+	check(scene.buttons.has("score") and scene.buttons.has("undo"), "Score and undo controls visible")
+	await click("market_0")
+	check(scene.game.selected_group == 0, "Market group selected")
+	await click("undo")
+	check(scene.game.selected_group == -1, "Undo market selection")
+	await click("market_0")
+	var first = scene.board_hit[0]
+	scene._handle_click(first.center)
+	await settle()
+	check(scene.game.selected_tokens.size() == 2, "Token placed through real hit region")
+	await click("undo")
+	check(scene.game.selected_tokens.size() == 3 and scene.game.board[first.cell].is_empty(), "Undo token placement through UI")
+	var placed = 0
+	for item in scene.board_hit:
+		scene._handle_click(item.center)
+		await settle()
+		placed += 1
+		if scene.game.selected_tokens.is_empty(): break
+	check(scene.game.selected_tokens.is_empty(), "All selected tokens placed")
+	await click("detail_0")
+	check(not scene.detail_card.is_empty(), "Card detail shown")
+	check(scene.buttons.has("draft_0"), "Draft available")
+	await click("draft_0")
+	check(scene.game.acquired.size() == 1, "Card drafted through detail")
+	await click("score")
+	check(scene.screen == "score", "Live score overlay opens")
+	check_buttons("score")
+	await click("close_score")
+	check(scene.screen == "game", "Live score overlay closes")
+	await click("pause")
+	check(scene.screen == "pause", "Pause shown")
+	check_buttons("pause")
+	await click("save_home")
+	check(scene.screen == "home" and scene.saved_game_available, "Save and main menu shows Continue")
+	check_buttons("home_saved")
+	await click("continue")
+	check(scene.screen == "game" and scene.game.turn == 1 and scene.game.acquired.size() == 1, "Continue restores saved game")
+	await click("end")
+	check(scene.game.turn == 2, "End turn works")
+	check(not scene.game.can_undo(), "Undo unavailable across turn boundary")
+	await click("detail_1")
+	check(scene.buttons.has("refresh_1"), "Refresh available when not drafted")
+	await click("refresh_1")
+	check(scene.game.refreshed, "Refresh updates state")
+	for i in range(5):
+		var card = EcoRules.card_by_id(i + 1).duplicate(true)
+		card["cubes"] = 0
+		scene.game.acquired.append(card)
+	scene.hand_page = 0
+	await settle()
+	check(scene.buttons.has("hand_next"), "Owned card pager appears")
+	await click("hand_next")
+	check(scene.hand_page == 1, "Owned card pager advances")
+	await click("hand_prev")
+	check(scene.hand_page == 0, "Owned card pager returns")
+	await click("pause")
+	await click("resume")
+	check(scene.screen == "game", "Resume works")
+	scene._handle_back()
+	check(scene.screen == "pause", "Android back opens pause")
+	await click("help")
+	check(scene.screen == "help", "Help shown")
+	check_buttons("help")
+	await click("home")
+	await click("records")
+	check(scene.screen == "records", "Records shown")
+	check_buttons("records")
+	await click("home")
+	await click("sound")
+	check(not scene.sound_enabled, "Sound toggles")
+	for player in scene.audio.values(): player.stop()
+	print("Eco Masters UI ", root.size, ": ", checks, " checks, ", failures, " failures")
 	scene.queue_free()
-	await frames()
-	print("Eco Masters UI %dx%d: %d checks, %d failures" % [root.size.x, root.size.y, checks, failures])
-	quit(0 if failures == 0 else 1)
+	await process_frame
+	quit(1 if failures else 0)
+
