@@ -38,7 +38,7 @@ func run_all() -> void:
 	test_rotations()
 	test_scoring()
 	test_game_flow()
-	test_v11_state()
+	run_v11_state_tests()
 
 func blank(side: String = "A") -> Dictionary:
 	return EcoRules.empty_board(side)
@@ -166,7 +166,7 @@ func test_game_flow() -> void:
 				game.place_token(cell, 0)
 				did_place = true
 				break
-			if not did_place: break
+		if not did_place: break
 	check(game.selected_tokens.is_empty(), "Three empty-board placements")
 	check(game.end_turn(), "End turn succeeds")
 	check(game.turn == 2 and game.bag.size() == 102, "Discard other groups and refill")
